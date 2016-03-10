@@ -147,6 +147,14 @@ func (a *Agent) serverConfig() (*nomad.Config, error) {
 		conf.NodeGCThreshold = dur
 	}
 
+	if heartbeatGrace := a.config.Server.HeartbeatGrace; heartbeatGrace != "" {
+		dur, err := time.ParseDuration(heartbeatGrace)
+		if err != nil {
+			return nil, err
+		}
+		conf.HeartbeatGrace = dur
+	}
+
 	return conf, nil
 }
 
@@ -191,8 +199,8 @@ func (a *Agent) clientConfig() (*clientconfig.Config, error) {
 		}
 		conf.MaxKillTimeout = dur
 	}
-	conf.ClientMaxPort = a.config.Client.ClientMaxPort
-	conf.ClientMinPort = a.config.Client.ClientMinPort
+	conf.ClientMaxPort = uint(a.config.Client.ClientMaxPort)
+	conf.ClientMinPort = uint(a.config.Client.ClientMinPort)
 
 	// Setup the node
 	conf.Node = new(structs.Node)

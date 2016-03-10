@@ -1,12 +1,19 @@
 ## 0.3.1 (UNRELEASED)
 
 IMPROVEMENTS:
+  * client: Added the allocation index environment variable [GH-896]
   * client: Add environment variables for task name, allocation ID/Name [GH-869]
   * client: Starting task is retried under the restart policy if the error is
     recoverable [GH-859]
+  * driver/docker: Support for ECR [GH-858]
+  * driver/docker: Periodic Fingerprinting [GH-893]
 
 BUG FIXES:
+  * core: No longer cancel evaluations that are delayed in the plan queue
+    [GH-884]
+  * api: Guard client/fs/ APIs from being accessed on a non-client node [GH-890]
   * client: Allow dashes in variable names during interprelation [GH-857]
+  * client: Updating kill timeout adheres to operator specified maximum value [GH-878]
   * consul: Remove concurrent map access [GH-874]
   * driver/exec: Stopping tasks with more than one pid in a cgroup [GH-855]
 
