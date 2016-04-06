@@ -63,6 +63,9 @@ sudo usermod -aG docker vagrant
 # Setup Nomad for development
 cd /opt/gopath/src/github.com/hashicorp/nomad && make bootstrap
 
+# Install rkt
+bash scripts/install_rkt.sh
+
 # CD into the nomad working directory when we login to the VM
 grep "cd /opt/gopath/src/github.com/hashicorp/nomad" ~/.profile || echo "cd /opt/gopath/src/github.com/hashicorp/nomad" >> ~/.profile
 SCRIPT

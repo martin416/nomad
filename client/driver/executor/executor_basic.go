@@ -2,15 +2,13 @@
 
 package executor
 
-import (
-	cgroupConfig "github.com/opencontainers/runc/libcontainer/configs"
-)
+import cgroupConfig "github.com/opencontainers/runc/libcontainer/configs"
 
 func (e *UniversalExecutor) configureChroot() error {
 	return nil
 }
 
-func DestroyCgroup(groups *cgroupConfig.Cgroup) error {
+func DestroyCgroup(groups *cgroupConfig.Cgroup, paths map[string]string) error {
 	return nil
 }
 

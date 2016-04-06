@@ -111,7 +111,7 @@ job "example" {
 			attempts = 10
 			interval = "5m"
 			
-			# A delay between a task failing and a restart occuring.
+			# A delay between a task failing and a restart occurring.
 			delay = "25s"
 
 			# Mode controls what happens when a task has restarted "attempts"
@@ -158,11 +158,21 @@ job "example" {
 					}
 				}
 			}
+
+			# The artifact block can be specified one or more times to download
+			# artifacts prior to the task being started. This is convenient for
+			# shipping configs or data needed by the task.
+			# artifact {
+			#	  source = "http://foo.com/artifact.tar.gz"
+			#	  options {
+			#	      checksum = "md5:c4aa853ad2215426eb7d70a21922e794"
+			#     }
+			# }
 			
 			# Specify configuration related to log rotation
 			# logs {
-			#	max_files = 10
-			#	max_file_size = 15
+			#     max_files = 10
+			#	  max_file_size = 15
 			# }
 			 
 			# Controls the timeout between signalling a task it will be killed

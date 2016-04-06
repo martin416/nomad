@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/nomad/api"
+	"github.com/hashicorp/nomad/client"
 )
 
 type AllocStatusCommand struct {
@@ -75,50 +76,47 @@ func (c *AllocStatusCommand) Run(args []string) int {
 	}
 
 	// Query the allocation info
-	alloc, _, err := client.Allocations().Info(allocID, nil)
-	if err != nil {
-		if len(allocID) == 1 {
-			c.Ui.Error(fmt.Sprintf("Identifier must contain at least two characters."))
-			return 1
-		}
-		if len(allocID)%2 == 1 {
-			// Identifiers must be of even length, so we strip off the last byte
-			// to provide a consistent user experience.
-			allocID = allocID[:len(allocID)-1]
-		}
+	if len(allocID) == 1 {
+		c.Ui.Error(fmt.Sprintf("Identifier must contain at least two characters."))
+		return 1
+	}
+	if len(allocID)%2 == 1 {
+		// Identifiers must be of even length, so we strip off the last byte
+		// to provide a consistent user experience.
+		allocID = allocID[:len(allocID)-1]
+	}
 
-		allocs, _, err := client.Allocations().PrefixList(allocID)
-		if err != nil {
-			c.Ui.Error(fmt.Sprintf("Error querying allocation: %v", err))
-			return 1
+	allocs, _, err := client.Allocations().PrefixList(allocID)
+	if err != nil {
+		c.Ui.Error(fmt.Sprintf("Error querying allocation: %v", err))
+		return 1
+	}
+	if len(allocs) == 0 {
+		c.Ui.Error(fmt.Sprintf("No allocation(s) with prefix or id %q found", allocID))
+		return 1
+	}
+	if len(allocs) > 1 {
+		// Format the allocs
+		out := make([]string, len(allocs)+1)
+		out[0] = "ID|Eval ID|Job ID|Task Group|Desired Status|Client Status"
+		for i, alloc := range allocs {
+			out[i+1] = fmt.Sprintf("%s|%s|%s|%s|%s|%s",
+				limit(alloc.ID, length),
+				limit(alloc.EvalID, length),
+				alloc.JobID,
+				alloc.TaskGroup,
+				alloc.DesiredStatus,
+				alloc.ClientStatus,
+			)
 		}
-		if len(allocs) == 0 {
-			c.Ui.Error(fmt.Sprintf("No allocation(s) with prefix or id %q found", allocID))
-			return 1
-		}
-		if len(allocs) > 1 {
-			// Format the allocs
-			out := make([]string, len(allocs)+1)
-			out[0] = "ID|Eval ID|Job ID|Task Group|Desired Status|Client Status"
-			for i, alloc := range allocs {
-				out[i+1] = fmt.Sprintf("%s|%s|%s|%s|%s|%s",
-					limit(alloc.ID, length),
-					limit(alloc.EvalID, length),
-					alloc.JobID,
-					alloc.TaskGroup,
-					alloc.DesiredStatus,
-					alloc.ClientStatus,
-				)
-			}
-			c.Ui.Output(fmt.Sprintf("Prefix matched multiple allocations\n\n%s", formatList(out)))
-			return 0
-		}
-		// Prefix lookup matched a single allocation
-		alloc, _, err = client.Allocations().Info(allocs[0].ID, nil)
-		if err != nil {
-			c.Ui.Error(fmt.Sprintf("Error querying allocation: %s", err))
-			return 1
-		}
+		c.Ui.Output(fmt.Sprintf("Prefix matched multiple allocations\n\n%s", formatList(out)))
+		return 0
+	}
+	// Prefix lookup matched a single allocation
+	alloc, _, err := client.Allocations().Info(allocs[0].ID, nil)
+	if err != nil {
+		c.Ui.Error(fmt.Sprintf("Error querying allocation: %s", err))
+		return 1
 	}
 
 	// Format the allocation data
@@ -129,13 +127,21 @@ func (c *AllocStatusCommand) Run(args []string) int {
 		fmt.Sprintf("Node ID|%s", limit(alloc.NodeID, length)),
 		fmt.Sprintf("Job ID|%s", alloc.JobID),
 		fmt.Sprintf("Client Status|%s", alloc.ClientStatus),
-		fmt.Sprintf("Evaluated Nodes|%d", alloc.Metrics.NodesEvaluated),
-		fmt.Sprintf("Filtered Nodes|%d", alloc.Metrics.NodesFiltered),
-		fmt.Sprintf("Exhausted Nodes|%d", alloc.Metrics.NodesExhausted),
-		fmt.Sprintf("Allocation Time|%s", alloc.Metrics.AllocationTime),
-		fmt.Sprintf("Failures|%d", alloc.Metrics.CoalescedFailures),
+	}
+
+	if verbose {
+		basic = append(basic,
+			fmt.Sprintf("Evaluated Nodes|%d", alloc.Metrics.NodesEvaluated),
+			fmt.Sprintf("Filtered Nodes|%d", alloc.Metrics.NodesFiltered),
+			fmt.Sprintf("Exhausted Nodes|%d", alloc.Metrics.NodesExhausted),
+			fmt.Sprintf("Allocation Time|%s", alloc.Metrics.AllocationTime),
+			fmt.Sprintf("Failures|%d", alloc.Metrics.CoalescedFailures))
 	}
 	c.Ui.Output(formatKV(basic))
+
+	if !short {
+		c.taskResources(alloc)
+	}
 
 	// Print the state of each task.
 	if short {
@@ -145,12 +151,9 @@ func (c *AllocStatusCommand) Run(args []string) int {
 	}
 
 	// Format the detailed status
-	c.Ui.Output("\n==> Status")
-	dumpAllocStatus(c.Ui, alloc, length)
-
-	if !short {
-		c.Ui.Output("\n==> Resources")
-		c.taskResources(alloc)
+	if verbose || alloc.DesiredStatus == "failed" {
+		c.Ui.Output("\n==> Status")
+		dumpAllocStatus(c.Ui, alloc, length)
 	}
 
 	return 0
@@ -161,7 +164,6 @@ func (c *AllocStatusCommand) shortTaskStatus(alloc *api.Allocation) {
 	tasks := make([]string, 0, len(alloc.TaskStates)+1)
 	tasks = append(tasks, "Name|State|Last Event|Time")
 	for task := range c.sortedTaskStateIterator(alloc.TaskStates) {
-		fmt.Println(task)
 		state := alloc.TaskStates[task]
 		lastState := state.State
 		var lastEvent, lastTime string
@@ -199,11 +201,25 @@ func (c *AllocStatusCommand) taskStatus(alloc *api.Allocation) {
 				desc = "Task started by client"
 			case api.TaskReceived:
 				desc = "Task received by client"
+			case api.TaskFailedValidation:
+				if event.ValidationError != "" {
+					desc = event.ValidationError
+				} else {
+					desc = "Validation of task failed"
+				}
 			case api.TaskDriverFailure:
 				if event.DriverError != "" {
 					desc = event.DriverError
 				} else {
 					desc = "Failed to start task"
+				}
+			case api.TaskDownloadingArtifacts:
+				desc = "Client is downloading artifacts"
+			case api.TaskArtifactDownloadFailed:
+				if event.DownloadError != "" {
+					desc = event.DownloadError
+				} else {
+					desc = "Failed to download artifacts"
 				}
 			case api.TaskKilled:
 				if event.KillError != "" {
@@ -224,9 +240,18 @@ func (c *AllocStatusCommand) taskStatus(alloc *api.Allocation) {
 				}
 				desc = strings.Join(parts, ", ")
 			case api.TaskRestarting:
-				desc = fmt.Sprintf("Task restarting in %v", time.Duration(event.StartDelay))
+				in := fmt.Sprintf("Task restarting in %v", time.Duration(event.StartDelay))
+				if event.RestartReason != "" && event.RestartReason != client.ReasonWithinPolicy {
+					desc = fmt.Sprintf("%s - %s", event.RestartReason, in)
+				} else {
+					desc = in
+				}
 			case api.TaskNotRestarting:
-				desc = "Task exceeded restart policy"
+				if event.RestartReason != "" {
+					desc = event.RestartReason
+				} else {
+					desc = "Task exceeded restart policy"
+				}
 			}
 
 			// Reverse order so we are sorted by time
@@ -264,8 +289,8 @@ func (c *AllocStatusCommand) sortedTaskStateIterator(m map[string]*api.TaskState
 	return output
 }
 
-// taskResources prints out the tasks current resource usage
-func (c *AllocStatusCommand) taskResources(alloc *api.Allocation) {
+// allocResources prints out the allocation current resource usage
+func (c *AllocStatusCommand) allocResources(alloc *api.Allocation) {
 	resources := make([]string, 2)
 	resources[0] = "CPU|Memory MB|Disk MB|IOPS"
 	resources[1] = fmt.Sprintf("%v|%v|%v|%v",
@@ -274,4 +299,45 @@ func (c *AllocStatusCommand) taskResources(alloc *api.Allocation) {
 		alloc.Resources.DiskMB,
 		alloc.Resources.IOPS)
 	c.Ui.Output(formatList(resources))
+}
+
+// taskResources prints out the tasks current resource usage
+func (c *AllocStatusCommand) taskResources(alloc *api.Allocation) {
+	if len(alloc.TaskResources) == 0 {
+		return
+	}
+
+	c.Ui.Output("\n==> Task Resources")
+	firstLine := true
+	for task, resource := range alloc.TaskResources {
+		header := fmt.Sprintf("\nTask: %q", task)
+		if firstLine {
+			header = fmt.Sprintf("Task: %q", task)
+			firstLine = false
+		}
+		c.Ui.Output(header)
+		var addr []string
+		for _, nw := range resource.Networks {
+			ports := append(nw.DynamicPorts, nw.ReservedPorts...)
+			for _, port := range ports {
+				addr = append(addr, fmt.Sprintf("%v: %v:%v\n", port.Label, nw.IP, port.Value))
+			}
+		}
+		var resourcesOutput []string
+		resourcesOutput = append(resourcesOutput, "CPU|Memory MB|Disk MB|IOPS|Addresses")
+		firstAddr := ""
+		if len(addr) > 0 {
+			firstAddr = addr[0]
+		}
+		resourcesOutput = append(resourcesOutput, fmt.Sprintf("%v|%v|%v|%v|%v",
+			resource.CPU,
+			resource.MemoryMB,
+			resource.DiskMB,
+			resource.IOPS,
+			firstAddr))
+		for i := 1; i < len(addr); i++ {
+			resourcesOutput = append(resourcesOutput, fmt.Sprintf("||||%v", addr[i]))
+		}
+		c.Ui.Output(formatListWithSpaces(resourcesOutput))
+	}
 }

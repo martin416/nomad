@@ -2,8 +2,17 @@ package structs
 
 import (
 	"fmt"
+	"time"
 
 	cgroupConfig "github.com/opencontainers/runc/libcontainer/configs"
+)
+
+const (
+	// The default user that the executor uses to run tasks
+	DefaultUnpriviledgedUser = "nobody"
+
+	// CheckBufSize is the size of the check output result
+	CheckBufSize = 4 * 1024
 )
 
 // WaitResult stores the result of a Wait operation.
@@ -33,7 +42,8 @@ func (r *WaitResult) String() string {
 // IsolationConfig has information about the isolation mechanism the executor
 // uses to put resource constraints and isolation on the user process
 type IsolationConfig struct {
-	Cgroup *cgroupConfig.Cgroup
+	Cgroup      *cgroupConfig.Cgroup
+	CgroupPaths map[string]string
 }
 
 // RecoverableError wraps an error and marks whether it is recoverable and could
@@ -54,4 +64,12 @@ func NewRecoverableError(e error, recoverable bool) *RecoverableError {
 
 func (r *RecoverableError) Error() string {
 	return r.Err.Error()
+}
+
+// CheckResult encapsulates the result of a check
+type CheckResult struct {
+	ExitCode  int
+	Output    string
+	Timestamp time.Time
+	Err       error
 }

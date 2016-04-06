@@ -9,37 +9,21 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime/debug"
+	"strings"
 	"testing"
 	"time"
 
 	docker "github.com/fsouza/go-dockerclient"
 	"github.com/hashicorp/go-plugin"
+	"github.com/hashicorp/nomad/client/allocdir"
 	"github.com/hashicorp/nomad/client/config"
 	"github.com/hashicorp/nomad/client/driver/env"
 	cstructs "github.com/hashicorp/nomad/client/driver/structs"
+	"github.com/hashicorp/nomad/client/testutil"
 	"github.com/hashicorp/nomad/helper/discover"
 	"github.com/hashicorp/nomad/nomad/structs"
-	"github.com/hashicorp/nomad/testutil"
+	tu "github.com/hashicorp/nomad/testutil"
 )
-
-// dockerIsConnected checks to see if a docker daemon is available (local or remote)
-func dockerIsConnected(t *testing.T) bool {
-	client, err := docker.NewClientFromEnv()
-	if err != nil {
-		return false
-	}
-
-	// Creating a client doesn't actually connect, so make sure we do something
-	// like call Version() on it.
-	env, err := client.Version()
-	if err != nil {
-		t.Logf("Failed to connect to docker daemon: %s", err)
-		return false
-	}
-
-	t.Logf("Successfully connected to docker daemon running version %s", env.Get("Version"))
-	return true
-}
 
 func dockerIsRemote(t *testing.T) bool {
 	client, err := docker.NewClientFromEnv()
@@ -101,7 +85,7 @@ func dockerTask() (*structs.Task, int, int) {
 // If there is a problem during setup this function will abort or skip the test
 // and indicate the reason.
 func dockerSetup(t *testing.T, task *structs.Task) (*docker.Client, DriverHandle, func()) {
-	if !dockerIsConnected(t) {
+	if !testutil.DockerIsConnected(t) {
 		t.SkipNow()
 	}
 
@@ -145,7 +129,7 @@ func TestDockerDriver_Handle(t *testing.T) {
 	pluginConfig := &plugin.ClientConfig{
 		Cmd: exec.Command(bin, "syslog", f.Name()),
 	}
-	logCollector, pluginClient, err := createLogCollector(pluginConfig, os.Stdout, &config.Config{})
+	exec, pluginClient, err := createExecutor(pluginConfig, os.Stdout, &config.Config{})
 	if err != nil {
 		t.Fatalf("got an err: %v", err)
 	}
@@ -154,7 +138,7 @@ func TestDockerDriver_Handle(t *testing.T) {
 	h := &DockerHandle{
 		version:        "version",
 		imageID:        "imageid",
-		logCollector:   logCollector,
+		executor:       exec,
 		pluginClient:   pluginClient,
 		containerID:    "containerid",
 		killTimeout:    5 * time.Nanosecond,
@@ -183,7 +167,7 @@ func TestDockerDriver_Fingerprint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	if apply != dockerIsConnected(t) {
+	if apply != testutil.DockerIsConnected(t) {
 		t.Fatalf("Fingerprinter should detect when docker is available")
 	}
 	if node.Attributes["driver.docker"] != "1" {
@@ -194,7 +178,7 @@ func TestDockerDriver_Fingerprint(t *testing.T) {
 
 func TestDockerDriver_StartOpen_Wait(t *testing.T) {
 	t.Parallel()
-	if !dockerIsConnected(t) {
+	if !testutil.DockerIsConnected(t) {
 		t.SkipNow()
 	}
 
@@ -266,9 +250,71 @@ func TestDockerDriver_Start_Wait(t *testing.T) {
 		if !res.Successful() {
 			t.Fatalf("err: %v", res)
 		}
-	case <-time.After(time.Duration(testutil.TestMultiplier()*5) * time.Second):
+	case <-time.After(time.Duration(tu.TestMultiplier()*5) * time.Second):
 		t.Fatalf("timeout")
 	}
+}
+
+func TestDockerDriver_Start_LoadImage(t *testing.T) {
+	task := &structs.Task{
+		Name: "busybox-demo",
+		Config: map[string]interface{}{
+			"image":   "busybox",
+			"load":    []string{"busybox.tar"},
+			"command": "/bin/echo",
+			"args": []string{
+				"hello",
+			},
+		},
+		LogConfig: &structs.LogConfig{
+			MaxFiles:      10,
+			MaxFileSizeMB: 10,
+		},
+		Resources: &structs.Resources{
+			MemoryMB: 256,
+			CPU:      512,
+		},
+	}
+
+	driverCtx, execCtx := testDriverContexts(task)
+	defer execCtx.AllocDir.Destroy()
+	d := NewDockerDriver(driverCtx)
+
+	// Copy the test jar into the task's directory
+	taskDir, _ := execCtx.AllocDir.TaskDirs[task.Name]
+	dst := filepath.Join(taskDir, allocdir.TaskLocal, "busybox.tar")
+	copyFile("./test-resources/docker/busybox.tar", dst, t)
+
+	handle, err := d.Start(execCtx, task)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if handle == nil {
+		t.Fatalf("missing handle")
+	}
+	defer handle.Kill()
+
+	select {
+	case res := <-handle.WaitCh():
+		if !res.Successful() {
+			t.Fatalf("err: %v", res)
+		}
+	case <-time.After(time.Duration(tu.TestMultiplier()*5) * time.Second):
+		t.Fatalf("timeout")
+	}
+
+	// Check that data was written to the shared alloc directory.
+	outputFile := filepath.Join(execCtx.AllocDir.LogDir(), "busybox-demo.stdout.0")
+	act, err := ioutil.ReadFile(outputFile)
+	if err != nil {
+		t.Fatalf("Couldn't read expected output: %v", err)
+	}
+
+	exp := "hello"
+	if strings.TrimSpace(string(act)) != exp {
+		t.Fatalf("Command outputted %v; want %v", act, exp)
+	}
+
 }
 
 func TestDockerDriver_Start_Wait_AllocDir(t *testing.T) {
@@ -276,7 +322,7 @@ func TestDockerDriver_Start_Wait_AllocDir(t *testing.T) {
 	// This test requires that the alloc dir be mounted into docker as a volume.
 	// Because this cannot happen when docker is run remotely, e.g. when running
 	// docker in a VM, we skip this when we detect Docker is being run remotely.
-	if !dockerIsConnected(t) || dockerIsRemote(t) {
+	if !testutil.DockerIsConnected(t) || dockerIsRemote(t) {
 		t.SkipNow()
 	}
 
@@ -321,7 +367,7 @@ func TestDockerDriver_Start_Wait_AllocDir(t *testing.T) {
 		if !res.Successful() {
 			t.Fatalf("err: %v", res)
 		}
-	case <-time.After(time.Duration(testutil.TestMultiplier()*5) * time.Second):
+	case <-time.After(time.Duration(tu.TestMultiplier()*5) * time.Second):
 		t.Fatalf("timeout")
 	}
 
@@ -369,14 +415,14 @@ func TestDockerDriver_Start_Kill_Wait(t *testing.T) {
 		if res.Successful() {
 			t.Fatalf("should err: %v", res)
 		}
-	case <-time.After(time.Duration(testutil.TestMultiplier()*10) * time.Second):
+	case <-time.After(time.Duration(tu.TestMultiplier()*10) * time.Second):
 		t.Fatalf("timeout")
 	}
 }
 
 func TestDocker_StartN(t *testing.T) {
 	t.Parallel()
-	if !dockerIsConnected(t) {
+	if !testutil.DockerIsConnected(t) {
 		t.SkipNow()
 	}
 
@@ -421,7 +467,7 @@ func TestDocker_StartN(t *testing.T) {
 
 func TestDocker_StartNVersions(t *testing.T) {
 	t.Parallel()
-	if !dockerIsConnected(t) {
+	if !testutil.DockerIsConnected(t) {
 		t.SkipNow()
 	}
 
@@ -667,5 +713,47 @@ func TestDockerPortsMapping(t *testing.T) {
 		if !inSlice(search, container.Config.Env) {
 			t.Errorf("Expected to find %s in container environment: %+v", search, container.Config.Env)
 		}
+	}
+}
+
+func TestDockerUser(t *testing.T) {
+	t.Parallel()
+
+	task := &structs.Task{
+		Name: "redis-demo",
+		User: "alice",
+		Config: map[string]interface{}{
+			"image":   "redis",
+			"command": "sleep",
+			"args":    []string{"10000"},
+		},
+		Resources: &structs.Resources{
+			MemoryMB: 256,
+			CPU:      512,
+		},
+		LogConfig: &structs.LogConfig{
+			MaxFiles:      10,
+			MaxFileSizeMB: 10,
+		},
+	}
+
+	if !testutil.DockerIsConnected(t) {
+		t.SkipNow()
+	}
+
+	driverCtx, execCtx := testDriverContexts(task)
+	driver := NewDockerDriver(driverCtx)
+	defer execCtx.AllocDir.Destroy()
+
+	// It should fail because the user "alice" does not exist on the given
+	// image.
+	handle, err := driver.Start(execCtx, task)
+	if err == nil {
+		handle.Kill()
+		t.Fatalf("Should've failed")
+	}
+	msg := "System error: Unable to find user alice"
+	if !strings.Contains(err.Error(), msg) {
+		t.Fatalf("Expecting '%v' in '%v'", msg, err)
 	}
 }

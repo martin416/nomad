@@ -6,6 +6,7 @@ import (
 	"log"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -15,10 +16,15 @@ import (
 	"github.com/hashicorp/nomad/client/config"
 	"github.com/hashicorp/nomad/client/driver/executor"
 	cstructs "github.com/hashicorp/nomad/client/driver/structs"
-	"github.com/hashicorp/nomad/client/getter"
 	"github.com/hashicorp/nomad/helper/discover"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/mitchellh/mapstructure"
+)
+
+const (
+	// The key populated in Node Attributes to indicate the presence of the Exec
+	// driver
+	execDriverAttr = "driver.exec"
 )
 
 // ExecDriver fork/execs tasks using as many of the underlying OS's isolation
@@ -28,10 +34,8 @@ type ExecDriver struct {
 }
 
 type ExecDriverConfig struct {
-	ArtifactSource string   `mapstructure:"artifact_source"`
-	Checksum       string   `mapstructure:"checksum"`
-	Command        string   `mapstructure:"command"`
-	Args           []string `mapstructure:"args"`
+	Command string   `mapstructure:"command"`
+	Args    []string `mapstructure:"args"`
 }
 
 // execHandle is returned from Start/Open as a handle to the PID
@@ -55,16 +59,29 @@ func NewExecDriver(ctx *DriverContext) Driver {
 }
 
 func (d *ExecDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, error) {
+	// Get the current status so that we can log any debug messages only if the
+	// state changes
+	_, currentlyEnabled := node.Attributes[execDriverAttr]
+
 	// Only enable if cgroups are available and we are root
 	if _, ok := node.Attributes["unique.cgroup.mountpoint"]; !ok {
-		d.logger.Printf("[DEBUG] driver.exec: cgroups unavailable, disabling")
+		if currentlyEnabled {
+			d.logger.Printf("[DEBUG] driver.exec: cgroups unavailable, disabling")
+		}
+		delete(node.Attributes, execDriverAttr)
 		return false, nil
 	} else if syscall.Geteuid() != 0 {
-		d.logger.Printf("[DEBUG] driver.exec: must run as root user, disabling")
+		if currentlyEnabled {
+			d.logger.Printf("[DEBUG] driver.exec: must run as root user, disabling")
+		}
+		delete(node.Attributes, execDriverAttr)
 		return false, nil
 	}
 
-	node.Attributes["driver.exec"] = "1"
+	if !currentlyEnabled {
+		d.logger.Printf("[DEBUG] driver.exec: exec driver is enabled")
+	}
+	node.Attributes[execDriverAttr] = "1"
 	return true, nil
 }
 
@@ -77,31 +94,21 @@ func (d *ExecDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, 
 	if err := mapstructure.WeakDecode(task.Config, &driverConfig); err != nil {
 		return nil, err
 	}
+
 	// Get the command to be ran
 	command := driverConfig.Command
 	if err := validateCommand(command, "args"); err != nil {
 		return nil, err
 	}
 
-	// Create a location to download the artifact.
+	// Set the host environment variables.
+	filter := strings.Split(d.config.ReadDefault("env.blacklist", config.DefaultEnvBlacklist), ",")
+	d.taskEnv.AppendHostEnvvars(filter)
+
+	// Get the task directory for storing the executor logs.
 	taskDir, ok := ctx.AllocDir.TaskDirs[d.DriverContext.taskName]
 	if !ok {
 		return nil, fmt.Errorf("Could not find task directory for task: %v", d.DriverContext.taskName)
-	}
-
-	// Check if an artificat is specified and attempt to download it
-	source, ok := task.Config["artifact_source"]
-	if ok && source != "" {
-		// Proceed to download an artifact to be executed.
-		_, err := getter.GetArtifact(
-			taskDir,
-			driverConfig.ArtifactSource,
-			driverConfig.Checksum,
-			d.logger,
-		)
-		if err != nil {
-			return nil, err
-		}
 	}
 
 	bin, err := discover.NomadExecutable()
@@ -118,19 +125,23 @@ func (d *ExecDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, 
 		return nil, err
 	}
 	executorCtx := &executor.ExecutorContext{
-		TaskEnv:          d.taskEnv,
-		AllocDir:         ctx.AllocDir,
-		TaskName:         task.Name,
-		TaskResources:    task.Resources,
-		LogConfig:        task.LogConfig,
-		ResourceLimits:   true,
-		FSIsolation:      true,
-		UnprivilegedUser: true,
+		TaskEnv:  d.taskEnv,
+		Driver:   "exec",
+		AllocDir: ctx.AllocDir,
+		AllocID:  ctx.AllocID,
+		Task:     task,
 	}
-	ps, err := exec.LaunchCmd(&executor.ExecCommand{Cmd: command, Args: driverConfig.Args}, executorCtx)
+
+	ps, err := exec.LaunchCmd(&executor.ExecCommand{
+		Cmd:            command,
+		Args:           driverConfig.Args,
+		FSIsolation:    true,
+		ResourceLimits: true,
+		User:           getExecutorUser(task),
+	}, executorCtx)
 	if err != nil {
 		pluginClient.Kill()
-		return nil, fmt.Errorf("error starting process via the plugin: %v", err)
+		return nil, err
 	}
 	d.logger.Printf("[DEBUG] driver.exec: started process via plugin with pid: %v", ps.Pid)
 
@@ -148,6 +159,9 @@ func (d *ExecDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, 
 		version:         d.config.Version,
 		doneCh:          make(chan struct{}),
 		waitCh:          make(chan *cstructs.WaitResult, 1),
+	}
+	if err := exec.SyncServices(consulContext(d.config, "")); err != nil {
+		d.logger.Printf("[ERR] driver.exec: error registering services with consul for task: %q: %v", task.Name, err)
 	}
 	go h.run()
 	return h, nil
@@ -182,7 +196,7 @@ func (d *ExecDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, erro
 			merrs.Errors = append(merrs.Errors, fmt.Errorf("error destroying plugin and userpid: %v", e))
 		}
 		if id.IsolationConfig != nil {
-			if e := executor.DestroyCgroup(id.IsolationConfig.Cgroup); e != nil {
+			if e := executor.DestroyCgroup(id.IsolationConfig.Cgroup, id.IsolationConfig.CgroupPaths); e != nil {
 				merrs.Errors = append(merrs.Errors, fmt.Errorf("destroying cgroup failed: %v", e))
 			}
 		}
@@ -192,6 +206,8 @@ func (d *ExecDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, erro
 		return nil, fmt.Errorf("error connecting to plugin: %v", merrs.ErrorOrNil())
 	}
 
+	ver, _ := exec.Version()
+	d.logger.Printf("[DEBUG] driver.exec : version of executor: %v", ver.Version)
 	// Return a driver handle
 	h := &execHandle{
 		pluginClient:    client,
@@ -205,6 +221,9 @@ func (d *ExecDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, erro
 		maxKillTimeout:  id.MaxKillTimeout,
 		doneCh:          make(chan struct{}),
 		waitCh:          make(chan *cstructs.WaitResult, 1),
+	}
+	if err := exec.SyncServices(consulContext(d.config, "")); err != nil {
+		d.logger.Printf("[ERR] driver.exec: error registering services with consul: %v", err)
 	}
 	go h.run()
 	return h, nil
@@ -235,7 +254,7 @@ func (h *execHandle) WaitCh() chan *cstructs.WaitResult {
 func (h *execHandle) Update(task *structs.Task) error {
 	// Store the updated kill timeout.
 	h.killTimeout = GetKillTimeout(task.KillTimeout, h.maxKillTimeout)
-	h.executor.UpdateLogConfig(task.LogConfig)
+	h.executor.UpdateTask(task)
 
 	// Update is not possible
 	return nil
@@ -275,7 +294,7 @@ func (h *execHandle) run() {
 	// user pid might be holding onto.
 	if ps.ExitCode == 0 && err != nil {
 		if h.isolationConfig != nil {
-			if e := executor.DestroyCgroup(h.isolationConfig.Cgroup); e != nil {
+			if e := executor.DestroyCgroup(h.isolationConfig.Cgroup, h.isolationConfig.CgroupPaths); e != nil {
 				h.logger.Printf("[ERR] driver.exec: destroying cgroup failed while killing cgroup: %v", e)
 			}
 		}
@@ -283,7 +302,15 @@ func (h *execHandle) run() {
 			h.logger.Printf("[ERR] driver.exec: unmounting dev,proc and alloc dirs failed: %v", e)
 		}
 	}
-	h.waitCh <- cstructs.NewWaitResult(ps.ExitCode, 0, err)
+	h.waitCh <- cstructs.NewWaitResult(ps.ExitCode, ps.Signal, err)
 	close(h.waitCh)
+	// Remove services
+	if err := h.executor.DeregisterServices(); err != nil {
+		h.logger.Printf("[ERR] driver.exec: failed to deregister services: %v", err)
+	}
+
+	if err := h.executor.Exit(); err != nil {
+		h.logger.Printf("[ERR] driver.exec: error destroying executor: %v", err)
+	}
 	h.pluginClient.Kill()
 }

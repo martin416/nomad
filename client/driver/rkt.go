@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -38,6 +39,10 @@ const (
 
 	// bytesToMB is the conversion from bytes to megabytes.
 	bytesToMB = 1024 * 1024
+
+	// The key populated in the Node Attributes to indicate the presence of the
+	// Rkt driver
+	rktDriverAttr = "driver.rkt"
 )
 
 // RktDriver is a driver for running images via Rkt
@@ -49,8 +54,10 @@ type RktDriver struct {
 }
 
 type RktDriverConfig struct {
-	ImageName string   `mapstructure:"image"`
-	Args      []string `mapstructure:"args"`
+	ImageName        string   `mapstructure:"image"`
+	Args             []string `mapstructure:"args"`
+	DNSServers       []string `mapstructure:"dns_servers"`        // DNS Server for containers
+	DNSSearchDomains []string `mapstructure:"dns_search_domains"` // DNS Search domains for containers
 }
 
 // rktHandle is returned from Start/Open as a handle to the PID
@@ -82,14 +89,22 @@ func NewRktDriver(ctx *DriverContext) Driver {
 }
 
 func (d *RktDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, error) {
+	// Get the current status so that we can log any debug messages only if the
+	// state changes
+	_, currentlyEnabled := node.Attributes[rktDriverAttr]
+
 	// Only enable if we are root when running on non-windows systems.
 	if runtime.GOOS != "windows" && syscall.Geteuid() != 0 {
-		d.logger.Printf("[DEBUG] driver.rkt: must run as root user, disabling")
+		if currentlyEnabled {
+			d.logger.Printf("[DEBUG] driver.rkt: must run as root user, disabling")
+		}
+		delete(node.Attributes, rktDriverAttr)
 		return false, nil
 	}
 
 	outBytes, err := exec.Command("rkt", "version").Output()
 	if err != nil {
+		delete(node.Attributes, rktDriverAttr)
 		return false, nil
 	}
 	out := strings.TrimSpace(string(outBytes))
@@ -97,10 +112,11 @@ func (d *RktDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, e
 	rktMatches := reRktVersion.FindStringSubmatch(out)
 	appcMatches := reAppcVersion.FindStringSubmatch(out)
 	if len(rktMatches) != 2 || len(appcMatches) != 2 {
+		delete(node.Attributes, rktDriverAttr)
 		return false, fmt.Errorf("Unable to parse Rkt version string: %#v", rktMatches)
 	}
 
-	node.Attributes["driver.rkt"] = "1"
+	node.Attributes[rktDriverAttr] = "1"
 	node.Attributes["driver.rkt.version"] = rktMatches[1]
 	node.Attributes["driver.rkt.appc.version"] = appcMatches[1]
 
@@ -109,7 +125,7 @@ func (d *RktDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, e
 	if currentVersion.LessThan(minVersion) {
 		// Do not allow rkt < 0.14.0
 		d.logger.Printf("[WARN] driver.rkt: please upgrade rkt to a version >= %s", minVersion)
-		node.Attributes["driver.rkt"] = "0"
+		node.Attributes[rktDriverAttr] = "0"
 	}
 	return true, nil
 }
@@ -154,7 +170,7 @@ func (d *RktDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
 		insecure = true
 	}
 
-	cmdArgs = append(cmdArgs, "run", "--interactive")
+	cmdArgs = append(cmdArgs, "run")
 	cmdArgs = append(cmdArgs, fmt.Sprintf("--volume=%s,kind=host,source=%s", task.Name, ctx.AllocDir.SharedDir))
 	cmdArgs = append(cmdArgs, fmt.Sprintf("--mount=volume=%s,target=%s", task.Name, ctx.AllocDir.SharedDir))
 	cmdArgs = append(cmdArgs, img)
@@ -185,6 +201,22 @@ func (d *RktDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
 	// Add CPU isolator
 	cmdArgs = append(cmdArgs, fmt.Sprintf("--cpu=%vm", int64(task.Resources.CPU)))
 
+	// Add DNS servers
+	for _, ip := range driverConfig.DNSServers {
+		if err := net.ParseIP(ip); err == nil {
+			msg := fmt.Errorf("invalid ip address for container dns server %q", ip)
+			d.logger.Printf("[DEBUG] driver.rkt: %v", msg)
+			return nil, msg
+		} else {
+			cmdArgs = append(cmdArgs, fmt.Sprintf("--dns=%s", ip))
+		}
+	}
+
+	// set DNS search domains
+	for _, domain := range driverConfig.DNSSearchDomains {
+		cmdArgs = append(cmdArgs, fmt.Sprintf("--dns-search=%s", domain))
+	}
+
 	// Add user passed arguments.
 	if len(driverConfig.Args) != 0 {
 		parsed := d.taskEnv.ParseAndReplace(driverConfig.Args)
@@ -209,30 +241,38 @@ func (d *RktDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
 		Cmd: exec.Command(bin, "executor", pluginLogFile),
 	}
 
-	exec, pluginClient, err := createExecutor(pluginConfig, d.config.LogOutput, d.config)
+	execIntf, pluginClient, err := createExecutor(pluginConfig, d.config.LogOutput, d.config)
 	if err != nil {
 		return nil, err
 	}
 	executorCtx := &executor.ExecutorContext{
-		TaskEnv:          d.taskEnv,
-		AllocDir:         ctx.AllocDir,
-		TaskName:         task.Name,
-		TaskResources:    task.Resources,
-		UnprivilegedUser: false,
-		LogConfig:        task.LogConfig,
+		TaskEnv:  d.taskEnv,
+		Driver:   "rkt",
+		AllocDir: ctx.AllocDir,
+		AllocID:  ctx.AllocID,
+		Task:     task,
 	}
 
-	ps, err := exec.LaunchCmd(&executor.ExecCommand{Cmd: "rkt", Args: cmdArgs}, executorCtx)
+	absPath, err := GetAbsolutePath("rkt")
+	if err != nil {
+		return nil, err
+	}
+
+	ps, err := execIntf.LaunchCmd(&executor.ExecCommand{
+		Cmd:  absPath,
+		Args: cmdArgs,
+		User: task.User,
+	}, executorCtx)
 	if err != nil {
 		pluginClient.Kill()
-		return nil, fmt.Errorf("error starting process via the plugin: %v", err)
+		return nil, err
 	}
 
 	d.logger.Printf("[DEBUG] driver.rkt: started ACI %q with: %v", img, cmdArgs)
 	maxKill := d.DriverContext.config.MaxKillTimeout
 	h := &rktHandle{
 		pluginClient:   pluginClient,
-		executor:       exec,
+		executor:       execIntf,
 		executorPid:    ps.Pid,
 		allocDir:       ctx.AllocDir,
 		logger:         d.logger,
@@ -240,6 +280,9 @@ func (d *RktDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
 		maxKillTimeout: maxKill,
 		doneCh:         make(chan struct{}),
 		waitCh:         make(chan *cstructs.WaitResult, 1),
+	}
+	if h.executor.SyncServices(consulContext(d.config, "")); err != nil {
+		h.logger.Printf("[ERR] driver.rkt: error registering services for task: %q: %v", task.Name, err)
 	}
 	go h.run()
 	return h, nil
@@ -256,7 +299,7 @@ func (d *RktDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, error
 	pluginConfig := &plugin.ClientConfig{
 		Reattach: id.PluginConfig.PluginConfig(),
 	}
-	executor, pluginClient, err := createExecutor(pluginConfig, d.config.LogOutput, d.config)
+	exec, pluginClient, err := createExecutor(pluginConfig, d.config.LogOutput, d.config)
 	if err != nil {
 		d.logger.Println("[ERROR] driver.rkt: error connecting to plugin so destroying plugin pid and user pid")
 		if e := destroyPlugin(id.PluginConfig.Pid, id.ExecutorPid); e != nil {
@@ -265,19 +308,23 @@ func (d *RktDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, error
 		return nil, fmt.Errorf("error connecting to plugin: %v", err)
 	}
 
+	ver, _ := exec.Version()
+	d.logger.Printf("[DEBUG] driver.rkt: version of executor: %v", ver.Version)
 	// Return a driver handle
 	h := &rktHandle{
 		pluginClient:   pluginClient,
 		executorPid:    id.ExecutorPid,
 		allocDir:       id.AllocDir,
-		executor:       executor,
+		executor:       exec,
 		logger:         d.logger,
 		killTimeout:    id.KillTimeout,
 		maxKillTimeout: id.MaxKillTimeout,
 		doneCh:         make(chan struct{}),
 		waitCh:         make(chan *cstructs.WaitResult, 1),
 	}
-
+	if h.executor.SyncServices(consulContext(d.config, "")); err != nil {
+		h.logger.Printf("[ERR] driver.rkt: error registering services: %v", err)
+	}
 	go h.run()
 	return h, nil
 }
@@ -305,7 +352,7 @@ func (h *rktHandle) WaitCh() chan *cstructs.WaitResult {
 func (h *rktHandle) Update(task *structs.Task) error {
 	// Store the updated kill timeout.
 	h.killTimeout = GetKillTimeout(task.KillTimeout, h.maxKillTimeout)
-	h.executor.UpdateLogConfig(task.LogConfig)
+	h.executor.UpdateTask(task)
 
 	// Update is not possible
 	return nil
@@ -336,5 +383,13 @@ func (h *rktHandle) run() {
 	}
 	h.waitCh <- cstructs.NewWaitResult(ps.ExitCode, 0, err)
 	close(h.waitCh)
+	// Remove services
+	if err := h.executor.DeregisterServices(); err != nil {
+		h.logger.Printf("[ERR] driver.rkt: failed to deregister services: %v", err)
+	}
+
+	if err := h.executor.Exit(); err != nil {
+		h.logger.Printf("[ERR] driver.rkt: error killing executor: %v", err)
+	}
 	h.pluginClient.Kill()
 }

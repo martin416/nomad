@@ -154,6 +154,13 @@ func (n *nomadFSM) applyUpsertNode(buf []byte, index uint64) interface{} {
 		n.logger.Printf("[ERR] nomad.fsm: UpsertNode failed: %v", err)
 		return err
 	}
+
+	// Unblock evals for the nodes computed node class if it is in a ready
+	// state.
+	if req.Node.Status == structs.NodeStatusReady {
+		n.blockedEvals.Unblock(req.Node.ComputedClass)
+	}
+
 	return nil
 }
 
@@ -407,7 +414,7 @@ func (n *nomadFSM) applyAllocClientUpdate(buf []byte, index uint64) interface{} 
 	// Unblock evals for the nodes computed node class if the client has
 	// finished running an allocation.
 	for _, alloc := range req.Alloc {
-		if alloc.ClientStatus == structs.AllocClientStatusDead ||
+		if alloc.ClientStatus == structs.AllocClientStatusComplete ||
 			alloc.ClientStatus == structs.AllocClientStatusFailed {
 			nodeID := alloc.NodeID
 			node, err := n.state.NodeByID(nodeID)

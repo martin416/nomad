@@ -19,7 +19,8 @@ type ServiceCheck struct {
 	Id       string
 	Name     string
 	Type     string
-	Script   string
+	Command  string
+	Args     []string
 	Path     string
 	Protocol string
 	Interval time.Duration
@@ -84,6 +85,7 @@ type LogConfig struct {
 type Task struct {
 	Name        string
 	Driver      string
+	User        string
 	Config      map[string]interface{}
 	Constraints []*Constraint
 	Env         map[string]string
@@ -92,6 +94,14 @@ type Task struct {
 	Meta        map[string]string
 	KillTimeout time.Duration
 	LogConfig   *LogConfig
+	Artifacts   []*TaskArtifact
+}
+
+// TaskArtifact is used to download artifacts before running a task.
+type TaskArtifact struct {
+	GetterSource  string
+	GetterOptions map[string]string
+	RelativeDest  string
 }
 
 // NewTask creates and initializes a new Task.
@@ -147,24 +157,30 @@ type TaskState struct {
 }
 
 const (
-	TaskDriverFailure = "Driver Failure"
-	TaskReceived      = "Received"
-	TaskStarted       = "Started"
-	TaskTerminated    = "Terminated"
-	TaskKilled        = "Killed"
-	TaskRestarting    = "Restarting"
-	TaskNotRestarting = "Restarts Exceeded"
+	TaskDriverFailure          = "Driver Failure"
+	TaskReceived               = "Received"
+	TaskFailedValidation       = "Failed Validation"
+	TaskStarted                = "Started"
+	TaskTerminated             = "Terminated"
+	TaskKilled                 = "Killed"
+	TaskRestarting             = "Restarting"
+	TaskNotRestarting          = "Not Restarting"
+	TaskDownloadingArtifacts   = "Downloading Artifacts"
+	TaskArtifactDownloadFailed = "Failed Artifact Download"
 )
 
 // TaskEvent is an event that effects the state of a task and contains meta-data
 // appropriate to the events type.
 type TaskEvent struct {
-	Type        string
-	Time        int64
-	DriverError string
-	ExitCode    int
-	Signal      int
-	Message     string
-	KillError   string
-	StartDelay  int64
+	Type            string
+	Time            int64
+	RestartReason   string
+	DriverError     string
+	ExitCode        int
+	Signal          int
+	Message         string
+	KillError       string
+	StartDelay      int64
+	DownloadError   string
+	ValidationError string
 }

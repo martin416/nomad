@@ -22,39 +22,28 @@ var (
 	// A mapping of directories on the host OS to attempt to embed inside each
 	// task's chroot.
 	chrootEnv = map[string]string{
-		"/bin":       "/bin",
-		"/etc":       "/etc",
-		"/lib":       "/lib",
-		"/lib32":     "/lib32",
-		"/lib64":     "/lib64",
-		"/sbin":      "/sbin",
-		"/usr/bin":   "/usr/bin",
-		"/usr/sbin":  "/usr/sbin",
-		"/usr/lib":   "/usr/lib",
-		"/usr/share": "/usr/share",
+		"/bin":            "/bin",
+		"/etc":            "/etc",
+		"/lib":            "/lib",
+		"/lib32":          "/lib32",
+		"/lib64":          "/lib64",
+		"/run/resolvconf": "/run/resolvconf",
+		"/sbin":           "/sbin",
+		"/usr":            "/usr",
 	}
 )
 
 // configureIsolation configures chroot and creates cgroups
 func (e *UniversalExecutor) configureIsolation() error {
-	if e.ctx.FSIsolation {
+	if e.command.FSIsolation {
 		if err := e.configureChroot(); err != nil {
 			return err
 		}
 	}
 
-	if e.ctx.ResourceLimits {
-		if err := e.configureCgroups(e.ctx.TaskResources); err != nil {
+	if e.command.ResourceLimits {
+		if err := e.configureCgroups(e.ctx.Task.Resources); err != nil {
 			return fmt.Errorf("error creating cgroups: %v", err)
-		}
-		if err := e.applyLimits(os.Getpid()); err != nil {
-			if er := DestroyCgroup(e.groups); er != nil {
-				e.logger.Printf("[ERR] executor: error destroying cgroup: %v", er)
-			}
-			if er := e.removeChrootMounts(); er != nil {
-				e.logger.Printf("[ERR] executor: error removing chroot: %v", er)
-			}
-			return fmt.Errorf("error entering the plugin process in the cgroup: %v:", err)
 		}
 	}
 	return nil
@@ -62,20 +51,31 @@ func (e *UniversalExecutor) configureIsolation() error {
 
 // applyLimits puts a process in a pre-configured cgroup
 func (e *UniversalExecutor) applyLimits(pid int) error {
-	if !e.ctx.ResourceLimits {
+	if !e.command.ResourceLimits {
 		return nil
 	}
 
 	// Entering the process in the cgroup
-	manager := getCgroupManager(e.groups)
+	manager := getCgroupManager(e.groups, nil)
 	if err := manager.Apply(pid); err != nil {
-		e.logger.Printf("[ERR] executor: unable to join cgroup: %v", err)
-		if err := e.Exit(); err != nil {
-			e.logger.Printf("[ERR] executor: unable to kill process: %v", err)
+		e.logger.Printf("[ERR] executor: error applying pid to cgroup: %v", err)
+		if er := e.removeChrootMounts(); er != nil {
+			e.logger.Printf("[ERR] executor: error removing chroot: %v", er)
 		}
 		return err
 	}
-
+	e.cgPaths = manager.GetPaths()
+	cgConfig := cgroupConfig.Config{Cgroups: e.groups}
+	if err := manager.Set(&cgConfig); err != nil {
+		e.logger.Printf("[ERR] executor: error setting cgroup config: %v", err)
+		if er := DestroyCgroup(e.groups, e.cgPaths); er != nil {
+			e.logger.Printf("[ERR] executor: error destroying cgroup: %v", er)
+		}
+		if er := e.removeChrootMounts(); er != nil {
+			e.logger.Printf("[ERR] executor: error removing chroot: %v", er)
+		}
+		return err
+	}
 	return nil
 }
 
@@ -85,11 +85,7 @@ func (e *UniversalExecutor) configureCgroups(resources *structs.Resources) error
 	e.groups = &cgroupConfig.Cgroup{}
 	e.groups.Resources = &cgroupConfig.Resources{}
 	cgroupName := structs.GenerateUUID()
-	cgPath, err := cgroups.GetThisCgroupDir("devices")
-	if err != nil {
-		return fmt.Errorf("unable to get mount point for devices sub-system: %v", err)
-	}
-	e.groups.Path = filepath.Join(cgPath, cgroupName)
+	e.groups.Path = filepath.Join("/nomad", cgroupName)
 
 	// TODO: verify this is needed for things like network access
 	e.groups.Resources.AllowAllDevices = true
@@ -154,16 +150,19 @@ func (e *UniversalExecutor) runAs(userid string) error {
 // configureChroot configures a chroot
 func (e *UniversalExecutor) configureChroot() error {
 	allocDir := e.ctx.AllocDir
-	if err := allocDir.MountSharedDir(e.ctx.TaskName); err != nil {
+	if err := allocDir.MountSharedDir(e.ctx.Task.Name); err != nil {
 		return err
 	}
 
-	if err := allocDir.Embed(e.ctx.TaskName, chrootEnv); err != nil {
+	if err := allocDir.Embed(e.ctx.Task.Name, chrootEnv); err != nil {
 		return err
 	}
 
 	// Set the tasks AllocDir environment variable.
-	e.ctx.TaskEnv.SetAllocDir(filepath.Join("/", allocdir.SharedAllocName)).SetTaskLocalDir(filepath.Join("/", allocdir.TaskLocal)).Build()
+	e.ctx.TaskEnv.
+		SetAllocDir(filepath.Join("/", allocdir.SharedAllocName)).
+		SetTaskLocalDir(filepath.Join("/", allocdir.TaskLocal)).
+		Build()
 
 	if e.cmd.SysProcAttr == nil {
 		e.cmd.SysProcAttr = &syscall.SysProcAttr{}
@@ -182,28 +181,22 @@ func (e *UniversalExecutor) configureChroot() error {
 // should be called when tearing down the task.
 func (e *UniversalExecutor) removeChrootMounts() error {
 	// Prevent a race between Wait/ForceStop
-	e.lock.Lock()
-	defer e.lock.Unlock()
+	e.cgLock.Lock()
+	defer e.cgLock.Unlock()
 	return e.ctx.AllocDir.UnmountAll()
 }
 
 // destroyCgroup kills all processes in the cgroup and removes the cgroup
 // configuration from the host.
-func DestroyCgroup(groups *cgroupConfig.Cgroup) error {
+func DestroyCgroup(groups *cgroupConfig.Cgroup, cgPaths map[string]string) error {
 	merrs := new(multierror.Error)
 	if groups == nil {
 		return fmt.Errorf("Can't destroy: cgroup configuration empty")
 	}
 
-	manager := getCgroupManager(groups)
+	manager := getCgroupManager(groups, cgPaths)
 	if pids, perr := manager.GetPids(); perr == nil {
 		for _, pid := range pids {
-			// If the pid is the pid of the executor then we don't kill it, the
-			// executor is going to be killed by the driver once the Wait
-			// returns
-			if pid == os.Getpid() {
-				continue
-			}
 			proc, err := os.FindProcess(pid)
 			if err != nil {
 				merrs.Errors = append(merrs.Errors, fmt.Errorf("error finding process %v: %v", pid, err))
@@ -221,19 +214,15 @@ func DestroyCgroup(groups *cgroupConfig.Cgroup) error {
 	if err := manager.Destroy(); err != nil {
 		multierror.Append(merrs, fmt.Errorf("Failed to delete the cgroup directories: %v", err))
 	}
-
-	if len(merrs.Errors) != 0 {
-		return fmt.Errorf("errors while destroying cgroup: %v", merrs)
-	}
-	return nil
+	return merrs.ErrorOrNil()
 }
 
 // getCgroupManager returns the correct libcontainer cgroup manager.
-func getCgroupManager(groups *cgroupConfig.Cgroup) cgroups.Manager {
+func getCgroupManager(groups *cgroupConfig.Cgroup, paths map[string]string) cgroups.Manager {
 	var manager cgroups.Manager
-	manager = &cgroupFs.Manager{Cgroups: groups}
+	manager = &cgroupFs.Manager{Cgroups: groups, Paths: paths}
 	if systemd.UseSystemd() {
-		manager = &systemd.Manager{Cgroups: groups}
+		manager = &systemd.Manager{Cgroups: groups, Paths: paths}
 	}
 	return manager
 }

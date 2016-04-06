@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -591,7 +592,7 @@ func (s *Server) setupWorkers() error {
 }
 
 // numOtherPeers is used to check on the number of known peers
-// excluding the local ndoe
+// excluding the local node
 func (s *Server) numOtherPeers() (int, error) {
 	peers, err := s.raftPeers.Peers()
 	if err != nil {
@@ -715,12 +716,18 @@ func (s *Server) Stats() map[string]map[string]string {
 		"nomad": map[string]string{
 			"server":        "true",
 			"leader":        fmt.Sprintf("%v", s.IsLeader()),
+			"leader_addr":   s.raft.Leader(),
 			"bootstrap":     fmt.Sprintf("%v", s.config.Bootstrap),
 			"known_regions": toString(uint64(len(s.peers))),
 		},
 		"raft":    s.raft.Stats(),
 		"serf":    s.serf.Stats(),
 		"runtime": RuntimeStats(),
+	}
+	if peers, err := s.raftPeers.Peers(); err == nil {
+		stats["raft"]["raft_peers"] = strings.Join(peers, ",")
+	} else {
+		s.logger.Printf("[DEBUG] server: error getting raft peers: %v", err)
 	}
 	return stats
 }

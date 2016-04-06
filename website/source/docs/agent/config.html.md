@@ -62,6 +62,9 @@ server {
 client {
   enabled = true
   network_speed = 10
+  options {
+    "driver.raw_exec.enable" = "1"
+  }
 }
 
 atlas {
@@ -141,6 +144,22 @@ nodes, unless otherwise specified:
     server nodes from the same datacenter if possible. Used only on server
     nodes.
 
+* <a id="interfaces">`interfaces`</a>: Provides an alternative to the
+ `addresses` configuration. Operators can provide network device names to which
+ Nomad binds individual network services. Nomad looks for the first IPv4
+ address configured for the device and uses it, and if no IPv4 address is
+ present then it looks for an IPv6 address. The value is a map of device names of
+ network interfaces and supports the following keys:
+  <br>
+  * `http`: The device name the HTTP server is bound to. Applies to both clients and servers.
+  * `rpc`: The device name to bind the internal RPC interfaces to. Should be exposed
+    only to other cluster members if possible. Used only on server nodes, but
+    must be accessible from all agents.
+  * `serf`: The device name used to bind the gossip layer to. Both a TCP and UDP
+    listener will be exposed on this address. Should be restricted to only
+    server nodes from the same datacenter if possible. Used only on server
+    nodes.
+
 * `advertise`: Controls the advertise address for individual network services.
   This can be used to advertise a different address to the peers of a server
   node to support more complex network configurations such as NAT. This
@@ -190,7 +209,7 @@ nodes, unless otherwise specified:
 * `disable_anonymous_signature`: Disables providing an anonymous signature
   for de-duplication with the update check. See `disable_update_check`.
 
-* `http_api_response_headers`: This object allows adding headers to the 
+* `http_api_response_headers`: This object allows adding headers to the
   HTTP API responses. For example, the following config can be used to enable
   CORS on the HTTP API endpoints:
   ```
@@ -240,14 +259,18 @@ configured on client nodes.
     cluster.
   * <a id="retry_join">`retry_join`</a> Similar to [`start_join`](#start_join) but allows retrying a join
     if the first attempt fails. This is useful for cases where we know the
-    address will become available eventually.
+    address will become available eventually. Use `retry_join` with an array as a replacement for 
+    `start_join`, do not use both options.
   * <a id="retry_interval">`retry_interval`</a> The time to wait between join attempts. Defaults to 30s.
   * <a id="retry_max">`retry_max`</a> The maximum number of join attempts to be made before exiting
     with a return code of 1. By default, this is set to 0 which is interpreted
     as infinite retries.
-  * <a id="start_join">`start_join`</a> An array of strings specifying addresses of nodes to join upon startup.
-    If Nomad is unable to join with any of the specified addresses, agent startup will
-    fail. By default, the agent won't join any nodes when it starts up.
+  * <a id="start_join">`start_join`</a> An array of strings specifying addresses
+    of nodes to join upon startup. If Nomad is unable to join with any of the
+    specified addresses, agent startup will fail. By default, the agent won't
+    join any nodes when it starts up. Addresses can be given as an IP, a domain
+    name, or an IP:Port pair. If the port isn't specified the default Serf port,
+    4648, is used.  DNS names may also be used.
 
 ## Client-specific Options
 
@@ -296,6 +319,27 @@ configured on server nodes.
     task specifies a `kill_timeout` greater than `max_kill_timeout`,
     `max_kill_timeout` is used. This is to prevent a user being able to set an
     unreasonable timeout. If unset, a default is used.
+  * `reserved`: `reserved` is used to reserve a portion of the nodes resources
+    from being used by Nomad when placing tasks.  It can be used to target
+    a certain capacity usage for the node. For example, 20% of the nodes CPU
+    could be reserved to target a CPU utilization of 80%. The block has the
+    following format:
+
+    ```
+    reserved {
+        cpu = 500
+        memory = 512
+        disk = 1024
+        reserved_ports = "22,80,8500-8600"
+    }
+    ```
+
+    * `cpu`: `cpu` is given as MHz to reserve.
+    * `memory`: `memory` is given as MB to reserve.
+    * `disk`: `disk` is given as MB to reserve.
+    * `reserved_ports`: `reserved_ports` is a comma seperated list of ports
+      to reserve on all fingerprinted network devices. Ranges can be
+      specified by using a hyphen seperated the two inclusive ends.
 
 ### Client Options Map <a id="options_map"></a>
 
@@ -321,12 +365,38 @@ documentation [here](/docs/drivers/index.html)
 * `consul.verifyssl`: This option enables SSL verification when the transport
  scheme for the Consul API client is `https`. This is set to true by default.
 
-* `driver.whitelist`: A comma seperated list of whitelisted drivers (e.g.
+* `driver.whitelist`: A comma separated list of whitelisted drivers (e.g.
   "docker,qemu"). If specified, drivers not in the whitelist will be disabled.
   If the whitelist is empty, all drivers are fingerprinted and enabled where
   applicable.
 
-* `fingerprint.whitelist`: A comma seperated list of whitelisted fingerprinters.
+*   `env.blacklist`: Nomad passes the host environment variables to `exec`,
+    `raw_exec` and `java` tasks. `env.blacklist` is a comma seperated list of
+    environment variable keys not to pass to these tasks. If specified, the
+    defaults are overriden. The following are the default:
+    
+    * `CONSUL_TOKEN`
+    * `VAULT_TOKEN`
+    * `ATLAS_TOKEN`
+    * `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`
+    * `GOOGLE_APPLICATION_CREDENTIALS`
+
+*   `user.blacklist`: An operator specifiable blacklist of users which a task is
+    not allowed to run as when using a driver in `user.checked_drivers`.
+    Defaults to:
+    
+    * `root`
+    * `Administrator`
+
+*   `user.checked_drivers`: An operator specifiable list of drivers to enforce
+    the the `user.blacklist`. For drivers using containers, this enforcement often
+    doesn't make sense and as such the default is set to:
+    
+    * `exec`
+    * `qemu`
+    * `java`
+
+* `fingerprint.whitelist`: A comma separated list of whitelisted fingerprinters.
   If specified, fingerprinters not in the whitelist will be disabled. If the
   whitelist is empty, all fingerprinters are used.
 

@@ -30,13 +30,12 @@ func testAllocRunner(restarts bool) (*MockAllocStateUpdater, *AllocRunner) {
 	conf.AllocDir = os.TempDir()
 	upd := &MockAllocStateUpdater{}
 	alloc := mock.Alloc()
-	consulClient, _ := NewConsulService(&consulServiceConfig{logger, "127.0.0.1:8500", "", "", false, false, &structs.Node{}})
 	if !restarts {
 		*alloc.Job.LookupTaskGroup(alloc.TaskGroup).RestartPolicy = structs.RestartPolicy{Attempts: 0}
 		alloc.Job.Type = structs.JobTypeBatch
 	}
 
-	ar := NewAllocRunner(logger, conf, upd.Update, alloc, consulClient)
+	ar := NewAllocRunner(logger, conf, upd.Update, alloc)
 	return upd, ar
 }
 
@@ -51,8 +50,8 @@ func TestAllocRunner_SimpleRun(t *testing.T) {
 			return false, fmt.Errorf("No updates")
 		}
 		last := upd.Allocs[upd.Count-1]
-		if last.ClientStatus != structs.AllocClientStatusDead {
-			return false, fmt.Errorf("got status %v; want %v", last.ClientStatus, structs.AllocClientStatusDead)
+		if last.ClientStatus != structs.AllocClientStatusComplete {
+			return false, fmt.Errorf("got status %v; want %v", last.ClientStatus, structs.AllocClientStatusComplete)
 		}
 		return true, nil
 	}, func(err error) {
@@ -96,8 +95,8 @@ func TestAllocRunner_TerminalUpdate_Destroy(t *testing.T) {
 
 		// Check the status has changed.
 		last := upd.Allocs[upd.Count-1]
-		if last.ClientStatus != structs.AllocClientStatusDead {
-			return false, fmt.Errorf("got client status %v; want %v", last.ClientStatus, structs.AllocClientStatusDead)
+		if last.ClientStatus != structs.AllocClientStatusComplete {
+			return false, fmt.Errorf("got client status %v; want %v", last.ClientStatus, structs.AllocClientStatusComplete)
 		}
 
 		// Check the state still exists
@@ -125,8 +124,8 @@ func TestAllocRunner_TerminalUpdate_Destroy(t *testing.T) {
 
 		// Check the status has changed.
 		last := upd.Allocs[upd.Count-1]
-		if last.ClientStatus != structs.AllocClientStatusDead {
-			return false, fmt.Errorf("got client status %v; want %v", last.ClientStatus, structs.AllocClientStatusDead)
+		if last.ClientStatus != structs.AllocClientStatusComplete {
+			return false, fmt.Errorf("got client status %v; want %v", last.ClientStatus, structs.AllocClientStatusComplete)
 		}
 
 		// Check the state was cleaned
@@ -173,8 +172,8 @@ func TestAllocRunner_Destroy(t *testing.T) {
 
 		// Check the status has changed.
 		last := upd.Allocs[upd.Count-1]
-		if last.ClientStatus != structs.AllocClientStatusDead {
-			return false, fmt.Errorf("got client status %v; want %v", last.ClientStatus, structs.AllocClientStatusDead)
+		if last.ClientStatus != structs.AllocClientStatusComplete {
+			return false, fmt.Errorf("got client status %v; want %v", last.ClientStatus, structs.AllocClientStatusComplete)
 		}
 
 		// Check the state was cleaned
@@ -250,9 +249,8 @@ func TestAllocRunner_SaveRestoreState(t *testing.T) {
 	}
 
 	// Create a new alloc runner
-	consulClient, err := NewConsulService(&consulServiceConfig{ar.logger, "127.0.0.1:8500", "", "", false, false, &structs.Node{}})
 	ar2 := NewAllocRunner(ar.logger, ar.config, upd.Update,
-		&structs.Allocation{ID: ar.alloc.ID}, consulClient)
+		&structs.Allocation{ID: ar.alloc.ID})
 	err = ar2.RestoreState()
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -281,11 +279,12 @@ func TestAllocRunner_SaveRestoreState(t *testing.T) {
 func TestAllocRunner_SaveRestoreState_TerminalAlloc(t *testing.T) {
 	ctestutil.ExecCompatible(t)
 	upd, ar := testAllocRunner(false)
+	ar.logger = prefixedTestLogger("ar1: ")
 
 	// Ensure task takes some time
 	task := ar.alloc.Job.TaskGroups[0].Tasks[0]
 	task.Config["command"] = "/bin/sleep"
-	task.Config["args"] = []string{"10"}
+	task.Config["args"] = []string{"1000"}
 	go ar.Run()
 
 	testutil.WaitForResult(func() (bool, error) {
@@ -293,7 +292,7 @@ func TestAllocRunner_SaveRestoreState_TerminalAlloc(t *testing.T) {
 			return false, fmt.Errorf("No updates")
 		}
 		last := upd.Allocs[upd.Count-1]
-		if last.ClientStatus == structs.AllocClientStatusRunning {
+		if last.ClientStatus != structs.AllocClientStatusRunning {
 			return false, fmt.Errorf("got status %v; want %v", last.ClientStatus, structs.AllocClientStatusRunning)
 		}
 		return true, nil
@@ -322,14 +321,15 @@ func TestAllocRunner_SaveRestoreState_TerminalAlloc(t *testing.T) {
 	ar.destroy = true
 
 	// Create a new alloc runner
-	consulClient, err := NewConsulService(&consulServiceConfig{ar.logger, "127.0.0.1:8500", "", "", false, false, &structs.Node{}})
 	ar2 := NewAllocRunner(ar.logger, ar.config, upd.Update,
-		&structs.Allocation{ID: ar.alloc.ID}, consulClient)
+		&structs.Allocation{ID: ar.alloc.ID})
+	ar2.logger = prefixedTestLogger("ar2: ")
 	err = ar2.RestoreState()
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
 	go ar2.Run()
+	ar2.logger.Println("[TESTING] starting second alloc runner")
 
 	testutil.WaitForResult(func() (bool, error) {
 		// Check the state still exists
@@ -348,6 +348,7 @@ func TestAllocRunner_SaveRestoreState_TerminalAlloc(t *testing.T) {
 	})
 
 	// Send the destroy signal and ensure the AllocRunner cleans up.
+	ar2.logger.Println("[TESTING] destroying second alloc runner")
 	ar2.Destroy()
 
 	testutil.WaitForResult(func() (bool, error) {
@@ -357,8 +358,8 @@ func TestAllocRunner_SaveRestoreState_TerminalAlloc(t *testing.T) {
 
 		// Check the status has changed.
 		last := upd.Allocs[upd.Count-1]
-		if last.ClientStatus != structs.AllocClientStatusDead {
-			return false, fmt.Errorf("got client status %v; want %v", last.ClientStatus, structs.AllocClientStatusDead)
+		if last.ClientStatus != structs.AllocClientStatusComplete {
+			return false, fmt.Errorf("got client status %v; want %v", last.ClientStatus, structs.AllocClientStatusComplete)
 		}
 
 		// Check the state was cleaned
@@ -373,6 +374,56 @@ func TestAllocRunner_SaveRestoreState_TerminalAlloc(t *testing.T) {
 			return false, fmt.Errorf("alloc dir still exists: %v", ar.ctx.AllocDir.AllocDir)
 		} else if !os.IsNotExist(err) {
 			return false, fmt.Errorf("stat err: %v", err)
+		}
+
+		return true, nil
+	}, func(err error) {
+		t.Fatalf("err: %v", err)
+	})
+}
+
+func TestAllocRunner_TaskFailed_KillTG(t *testing.T) {
+	ctestutil.ExecCompatible(t)
+	upd, ar := testAllocRunner(false)
+
+	// Create two tasks in the task group
+	task := ar.alloc.Job.TaskGroups[0].Tasks[0]
+	task.Config["command"] = "/bin/sleep"
+	task.Config["args"] = []string{"1000"}
+
+	task2 := ar.alloc.Job.TaskGroups[0].Tasks[0].Copy()
+	task2.Name = "task 2"
+	task2.Config = map[string]interface{}{"command": "invalidBinaryToFail"}
+	ar.alloc.Job.TaskGroups[0].Tasks = append(ar.alloc.Job.TaskGroups[0].Tasks, task2)
+	ar.alloc.TaskResources[task2.Name] = task2.Resources
+	//t.Logf("%#v", ar.alloc.Job.TaskGroups[0])
+	go ar.Run()
+
+	testutil.WaitForResult(func() (bool, error) {
+		if upd.Count == 0 {
+			return false, fmt.Errorf("No updates")
+		}
+		last := upd.Allocs[upd.Count-1]
+		if last.ClientStatus != structs.AllocClientStatusFailed {
+			return false, fmt.Errorf("got status %v; want %v", last.ClientStatus, structs.AllocClientStatusFailed)
+		}
+
+		// Task One should be killed
+		state1 := last.TaskStates[task.Name]
+		if state1.State != structs.TaskStateDead {
+			return false, fmt.Errorf("got state %v; want %v", state1.State, structs.TaskStateDead)
+		}
+		if lastE := state1.Events[len(state1.Events)-1]; lastE.Type != structs.TaskKilled {
+			return false, fmt.Errorf("got last event %v; want %v", lastE.Type, structs.TaskKilled)
+		}
+
+		// Task Two should be failed
+		state2 := last.TaskStates[task2.Name]
+		if state2.State != structs.TaskStateDead {
+			return false, fmt.Errorf("got state %v; want %v", state2.State, structs.TaskStateDead)
+		}
+		if !state2.Failed() {
+			return false, fmt.Errorf("task2 should have failed")
 		}
 
 		return true, nil

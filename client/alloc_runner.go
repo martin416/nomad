@@ -30,10 +30,9 @@ type AllocStateUpdater func(alloc *structs.Allocation)
 
 // AllocRunner is used to wrap an allocation and provide the execution context.
 type AllocRunner struct {
-	config        *config.Config
-	updater       AllocStateUpdater
-	logger        *log.Logger
-	consulService *ConsulService
+	config  *config.Config
+	updater AllocStateUpdater
+	logger  *log.Logger
 
 	alloc                  *structs.Allocation
 	allocClientStatus      string // Explicit status of allocation. Set when there are failures
@@ -49,12 +48,7 @@ type AllocRunner struct {
 	restored   map[string]struct{}
 	taskLock   sync.RWMutex
 
-	// taskReceivedTimer is used to mitigate updates sent to the server because
-	// we expect that shortly after receiving an alloc it will transistion
-	// state. We use a timer to send the update if this hasn't happened after a
-	// reasonable time.
-	taskReceivedTimer *time.Timer
-	taskStatusLock    sync.RWMutex
+	taskStatusLock sync.RWMutex
 
 	updateCh chan *structs.Allocation
 
@@ -76,20 +70,19 @@ type allocRunnerState struct {
 
 // NewAllocRunner is used to create a new allocation context
 func NewAllocRunner(logger *log.Logger, config *config.Config, updater AllocStateUpdater,
-	alloc *structs.Allocation, consulService *ConsulService) *AllocRunner {
+	alloc *structs.Allocation) *AllocRunner {
 	ar := &AllocRunner{
-		config:        config,
-		updater:       updater,
-		logger:        logger,
-		alloc:         alloc,
-		consulService: consulService,
-		dirtyCh:       make(chan struct{}, 1),
-		tasks:         make(map[string]*TaskRunner),
-		taskStates:    copyTaskStates(alloc.TaskStates),
-		restored:      make(map[string]struct{}),
-		updateCh:      make(chan *structs.Allocation, 64),
-		destroyCh:     make(chan struct{}),
-		waitCh:        make(chan struct{}),
+		config:     config,
+		updater:    updater,
+		logger:     logger,
+		alloc:      alloc,
+		dirtyCh:    make(chan struct{}, 1),
+		tasks:      make(map[string]*TaskRunner),
+		taskStates: copyTaskStates(alloc.TaskStates),
+		restored:   make(map[string]struct{}),
+		updateCh:   make(chan *structs.Allocation, 64),
+		destroyCh:  make(chan struct{}),
+		waitCh:     make(chan struct{}),
 	}
 	return ar
 }
@@ -125,7 +118,7 @@ func (r *AllocRunner) RestoreState() error {
 
 		task := &structs.Task{Name: name}
 		tr := NewTaskRunner(r.logger, r.config, r.setTaskState, r.ctx, r.Alloc(),
-			task, r.consulService)
+			task)
 		r.tasks[name] = tr
 
 		// Skip tasks in terminal states.
@@ -262,7 +255,7 @@ func (r *AllocRunner) Alloc() *structs.Allocation {
 	} else if pending {
 		alloc.ClientStatus = structs.AllocClientStatusPending
 	} else if dead {
-		alloc.ClientStatus = structs.AllocClientStatusDead
+		alloc.ClientStatus = structs.AllocClientStatusComplete
 	}
 
 	return alloc
@@ -314,25 +307,18 @@ func (r *AllocRunner) setTaskState(taskName, state string, event *structs.TaskEv
 	taskState.State = state
 	r.appendTaskEvent(taskState, event)
 
-	// We don't immediately mark ourselves as dirty, since in most cases there
-	// will immediately be another state transistion. This reduces traffic to
-	// the server.
-	if event != nil && event.Type == structs.TaskReceived {
-		if r.taskReceivedTimer == nil {
-			r.taskReceivedTimer = time.AfterFunc(taskReceivedSyncLimit, func() {
-				// Send a dirty signal to sync our state.
-				select {
-				case r.dirtyCh <- struct{}{}:
-				default:
-				}
-			})
+	// If the task failed, we should kill all the other tasks in the task group.
+	if state == structs.TaskStateDead && taskState.Failed() {
+		var destroyingTasks []string
+		for task, tr := range r.tasks {
+			if task != taskName {
+				destroyingTasks = append(destroyingTasks, task)
+				tr.Destroy()
+			}
 		}
-		return
-	}
-
-	// Cancel any existing received state timer.
-	if r.taskReceivedTimer != nil {
-		r.taskReceivedTimer.Stop()
+		if len(destroyingTasks) > 0 {
+			r.logger.Printf("[DEBUG] client: task %q failed, destroying other tasks in task group: %v", taskName, destroyingTasks)
+		}
 	}
 
 	select {
@@ -405,8 +391,9 @@ func (r *AllocRunner) Run() {
 		}
 
 		tr := NewTaskRunner(r.logger, r.config, r.setTaskState, r.ctx, r.Alloc(),
-			task.Copy(), r.consulService)
+			task.Copy())
 		r.tasks[task.Name] = tr
+		tr.MarkReceived()
 		go tr.Run()
 	}
 	r.taskLock.Unlock()

@@ -28,7 +28,7 @@ func (c *Client) Jobs() *Jobs {
 func (j *Jobs) Register(job *Job, q *WriteOptions) (string, *WriteMeta, error) {
 	var resp registerJobResponse
 
-	req := &registerJobRequest{job}
+	req := &RegisterJobRequest{job}
 	wm, err := j.client.write("/v1/jobs", req, &resp, q)
 	if err != nil {
 		return "", nil, err
@@ -61,6 +61,20 @@ func (j *Jobs) Info(jobID string, q *QueryOptions) (*Job, *QueryMeta, error) {
 		return nil, nil, err
 	}
 	return &resp, qm, nil
+}
+
+// RawJob is used to retrieve information about a particular
+// job given its unique ID and return the raw json.
+func (j *Jobs) RawJob(jobID string, q *QueryOptions) (string, *QueryMeta, error) {
+	if q == nil {
+		q = &QueryOptions{}
+	}
+	q.Pretty = true
+	raw, qm, err := j.client.rawQuery("/v1/job/"+jobID, q)
+	if err != nil {
+		return "", nil, err
+	}
+	return raw, qm, nil
 }
 
 // Allocations is used to return the allocs for a given job ID.
@@ -242,8 +256,8 @@ func (j *Job) AddPeriodicConfig(cfg *PeriodicConfig) *Job {
 	return j
 }
 
-// registerJobRequest is used to serialize a job registration
-type registerJobRequest struct {
+// RegisterJobRequest is used to serialize a job registration
+type RegisterJobRequest struct {
 	Job *Job
 }
 

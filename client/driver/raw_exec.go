@@ -6,6 +6,7 @@ import (
 	"log"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/go-plugin"
@@ -14,7 +15,6 @@ import (
 	"github.com/hashicorp/nomad/client/driver/executor"
 	cstructs "github.com/hashicorp/nomad/client/driver/structs"
 	"github.com/hashicorp/nomad/client/fingerprint"
-	"github.com/hashicorp/nomad/client/getter"
 	"github.com/hashicorp/nomad/helper/discover"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/mitchellh/mapstructure"
@@ -23,6 +23,10 @@ import (
 const (
 	// The option that enables this driver in the Config.Options map.
 	rawExecConfigOption = "driver.raw_exec.enable"
+
+	// The key populated in Node Attributes to indicate presence of the Raw Exec
+	// driver
+	rawExecDriverAttr = "driver.raw_exec"
 )
 
 // The RawExecDriver is a privileged version of the exec driver. It provides no
@@ -53,15 +57,22 @@ func NewRawExecDriver(ctx *DriverContext) Driver {
 }
 
 func (d *RawExecDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, error) {
+	// Get the current status so that we can log any debug messages only if the
+	// state changes
+	_, currentlyEnabled := node.Attributes[rawExecDriverAttr]
+
 	// Check that the user has explicitly enabled this executor.
 	enabled := cfg.ReadBoolDefault(rawExecConfigOption, false)
 
 	if enabled {
-		d.logger.Printf("[WARN] driver.raw_exec: raw exec is enabled. Only enable if needed")
-		node.Attributes["driver.raw_exec"] = "1"
+		if currentlyEnabled {
+			d.logger.Printf("[WARN] driver.raw_exec: raw exec is enabled. Only enable if needed")
+		}
+		node.Attributes[rawExecDriverAttr] = "1"
 		return true, nil
 	}
 
+	delete(node.Attributes, rawExecDriverAttr)
 	return false, nil
 }
 
@@ -83,20 +94,9 @@ func (d *RawExecDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandl
 		return nil, err
 	}
 
-	// Check if an artificat is specified and attempt to download it
-	source, ok := task.Config["artifact_source"]
-	if ok && source != "" {
-		// Proceed to download an artifact to be executed.
-		_, err := getter.GetArtifact(
-			taskDir,
-			driverConfig.ArtifactSource,
-			driverConfig.Checksum,
-			d.logger,
-		)
-		if err != nil {
-			return nil, err
-		}
-	}
+	// Set the host environment variables.
+	filter := strings.Split(d.config.ReadDefault("env.blacklist", config.DefaultEnvBlacklist), ",")
+	d.taskEnv.AppendHostEnvvars(filter)
 
 	bin, err := discover.NomadExecutable()
 	if err != nil {
@@ -112,16 +112,21 @@ func (d *RawExecDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandl
 		return nil, err
 	}
 	executorCtx := &executor.ExecutorContext{
-		TaskEnv:       d.taskEnv,
-		AllocDir:      ctx.AllocDir,
-		TaskName:      task.Name,
-		TaskResources: task.Resources,
-		LogConfig:     task.LogConfig,
+		TaskEnv:  d.taskEnv,
+		Driver:   "raw_exec",
+		AllocDir: ctx.AllocDir,
+		AllocID:  ctx.AllocID,
+		Task:     task,
 	}
-	ps, err := exec.LaunchCmd(&executor.ExecCommand{Cmd: command, Args: driverConfig.Args}, executorCtx)
+
+	ps, err := exec.LaunchCmd(&executor.ExecCommand{
+		Cmd:  command,
+		Args: driverConfig.Args,
+		User: task.User,
+	}, executorCtx)
 	if err != nil {
 		pluginClient.Kill()
-		return nil, fmt.Errorf("error starting process via the plugin: %v", err)
+		return nil, err
 	}
 	d.logger.Printf("[DEBUG] driver.raw_exec: started process with pid: %v", ps.Pid)
 
@@ -138,6 +143,9 @@ func (d *RawExecDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandl
 		logger:         d.logger,
 		doneCh:         make(chan struct{}),
 		waitCh:         make(chan *cstructs.WaitResult, 1),
+	}
+	if err := h.executor.SyncServices(consulContext(d.config, "")); err != nil {
+		h.logger.Printf("[ERR] driver.raw_exec: error registering services with consul for task: %q: %v", task.Name, err)
 	}
 	go h.run()
 	return h, nil
@@ -161,7 +169,7 @@ func (d *RawExecDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, e
 	pluginConfig := &plugin.ClientConfig{
 		Reattach: id.PluginConfig.PluginConfig(),
 	}
-	executor, pluginClient, err := createExecutor(pluginConfig, d.config.LogOutput, d.config)
+	exec, pluginClient, err := createExecutor(pluginConfig, d.config.LogOutput, d.config)
 	if err != nil {
 		d.logger.Println("[ERR] driver.raw_exec: error connecting to plugin so destroying plugin pid and user pid")
 		if e := destroyPlugin(id.PluginConfig.Pid, id.UserPid); e != nil {
@@ -170,10 +178,13 @@ func (d *RawExecDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, e
 		return nil, fmt.Errorf("error connecting to plugin: %v", err)
 	}
 
+	ver, _ := exec.Version()
+	d.logger.Printf("[DEBUG] driver.raw_exec: version of executor: %v", ver.Version)
+
 	// Return a driver handle
 	h := &rawExecHandle{
 		pluginClient:   pluginClient,
-		executor:       executor,
+		executor:       exec,
 		userPid:        id.UserPid,
 		logger:         d.logger,
 		killTimeout:    id.KillTimeout,
@@ -182,6 +193,9 @@ func (d *RawExecDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, e
 		version:        id.Version,
 		doneCh:         make(chan struct{}),
 		waitCh:         make(chan *cstructs.WaitResult, 1),
+	}
+	if err := h.executor.SyncServices(consulContext(d.config, "")); err != nil {
+		h.logger.Printf("[ERR] driver.raw_exec: error registering services with consul: %v", err)
 	}
 	go h.run()
 	return h, nil
@@ -211,7 +225,7 @@ func (h *rawExecHandle) WaitCh() chan *cstructs.WaitResult {
 func (h *rawExecHandle) Update(task *structs.Task) error {
 	// Store the updated kill timeout.
 	h.killTimeout = GetKillTimeout(task.KillTimeout, h.maxKillTimeout)
-	h.executor.UpdateLogConfig(task.LogConfig)
+	h.executor.UpdateTask(task)
 
 	// Update is not possible
 	return nil
@@ -251,7 +265,15 @@ func (h *rawExecHandle) run() {
 			h.logger.Printf("[ERR] driver.raw_exec: unmounting dev,proc and alloc dirs failed: %v", e)
 		}
 	}
-	h.waitCh <- &cstructs.WaitResult{ExitCode: ps.ExitCode, Signal: 0, Err: err}
+	h.waitCh <- &cstructs.WaitResult{ExitCode: ps.ExitCode, Signal: ps.Signal, Err: err}
 	close(h.waitCh)
+	// Remove services
+	if err := h.executor.DeregisterServices(); err != nil {
+		h.logger.Printf("[ERR] driver.raw_exec: failed to deregister services: %v", err)
+	}
+
+	if err := h.executor.Exit(); err != nil {
+		h.logger.Printf("[ERR] driver.raw_exec: error killing executor: %v", err)
+	}
 	h.pluginClient.Kill()
 }

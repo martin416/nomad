@@ -21,9 +21,14 @@ import (
 	"github.com/hashicorp/nomad/client/driver/executor"
 	cstructs "github.com/hashicorp/nomad/client/driver/structs"
 	"github.com/hashicorp/nomad/client/fingerprint"
-	"github.com/hashicorp/nomad/client/getter"
 	"github.com/hashicorp/nomad/helper/discover"
 	"github.com/hashicorp/nomad/nomad/structs"
+)
+
+const (
+	// The key populated in Node Attributes to indicate presence of the Java
+	// driver
+	javaDriverAttr = "driver.java"
 )
 
 // JavaDriver is a simple driver to execute applications packaged in Jars.
@@ -34,10 +39,9 @@ type JavaDriver struct {
 }
 
 type JavaDriverConfig struct {
-	JvmOpts        []string `mapstructure:"jvm_options"`
-	ArtifactSource string   `mapstructure:"artifact_source"`
-	Checksum       string   `mapstructure:"checksum"`
-	Args           []string `mapstructure:"args"`
+	JarPath string   `mapstructure:"jar_path"`
+	JvmOpts []string `mapstructure:"jvm_options"`
+	Args    []string `mapstructure:"args"`
 }
 
 // javaHandle is returned from Start/Open as a handle to the PID
@@ -63,9 +67,16 @@ func NewJavaDriver(ctx *DriverContext) Driver {
 }
 
 func (d *JavaDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, error) {
+	// Get the current status so that we can log any debug messages only if the
+	// state changes
+	_, currentlyEnabled := node.Attributes[javaDriverAttr]
+
 	// Only enable if we are root and cgroups are mounted when running on linux systems.
 	if runtime.GOOS == "linux" && (syscall.Geteuid() != 0 || !d.cgroupsMounted(node)) {
-		d.logger.Printf("[DEBUG] driver.java: must run as root user on linux, disabling")
+		if currentlyEnabled {
+			d.logger.Printf("[DEBUG] driver.java: root priviledges and mounted cgroups required on linux, disabling")
+		}
+		delete(node.Attributes, "driver.java")
 		return false, nil
 	}
 
@@ -78,6 +89,7 @@ func (d *JavaDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, 
 	err := cmd.Run()
 	if err != nil {
 		// assume Java wasn't found
+		delete(node.Attributes, javaDriverAttr)
 		return false, nil
 	}
 
@@ -93,7 +105,10 @@ func (d *JavaDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, 
 	}
 
 	if infoString == "" {
-		d.logger.Println("[WARN] driver.java: error parsing Java version information, aborting")
+		if currentlyEnabled {
+			d.logger.Println("[WARN] driver.java: error parsing Java version information, aborting")
+		}
+		delete(node.Attributes, javaDriverAttr)
 		return false, nil
 	}
 
@@ -106,7 +121,7 @@ func (d *JavaDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, 
 	versionString := info[0]
 	versionString = strings.TrimPrefix(versionString, "java version ")
 	versionString = strings.Trim(versionString, "\"")
-	node.Attributes["driver.java"] = "1"
+	node.Attributes[javaDriverAttr] = "1"
 	node.Attributes["driver.java.version"] = versionString
 	node.Attributes["driver.java.runtime"] = info[1]
 	node.Attributes["driver.java.vm"] = info[2]
@@ -119,23 +134,19 @@ func (d *JavaDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, 
 	if err := mapstructure.WeakDecode(task.Config, &driverConfig); err != nil {
 		return nil, err
 	}
+
+	// Set the host environment variables.
+	filter := strings.Split(d.config.ReadDefault("env.blacklist", config.DefaultEnvBlacklist), ",")
+	d.taskEnv.AppendHostEnvvars(filter)
+
 	taskDir, ok := ctx.AllocDir.TaskDirs[d.DriverContext.taskName]
 	if !ok {
 		return nil, fmt.Errorf("Could not find task directory for task: %v", d.DriverContext.taskName)
 	}
 
-	// Proceed to download an artifact to be executed.
-	path, err := getter.GetArtifact(
-		taskDir,
-		driverConfig.ArtifactSource,
-		driverConfig.Checksum,
-		d.logger,
-	)
-	if err != nil {
-		return nil, err
+	if driverConfig.JarPath == "" {
+		return nil, fmt.Errorf("jar_path must be specified")
 	}
-
-	jarName := filepath.Base(path)
 
 	args := []string{}
 	// Look for jvm options
@@ -145,7 +156,7 @@ func (d *JavaDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, 
 	}
 
 	// Build the argument list.
-	args = append(args, "-jar", jarName)
+	args = append(args, "-jar", driverConfig.JarPath)
 	if len(driverConfig.Args) != 0 {
 		args = append(args, driverConfig.Args...)
 	}
@@ -160,25 +171,33 @@ func (d *JavaDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, 
 		Cmd: exec.Command(bin, "executor", pluginLogFile),
 	}
 
-	exec, pluginClient, err := createExecutor(pluginConfig, d.config.LogOutput, d.config)
+	execIntf, pluginClient, err := createExecutor(pluginConfig, d.config.LogOutput, d.config)
 	if err != nil {
 		return nil, err
 	}
 	executorCtx := &executor.ExecutorContext{
-		TaskEnv:          d.taskEnv,
-		AllocDir:         ctx.AllocDir,
-		TaskName:         task.Name,
-		TaskResources:    task.Resources,
-		LogConfig:        task.LogConfig,
-		FSIsolation:      true,
-		UnprivilegedUser: true,
-		ResourceLimits:   true,
+		TaskEnv:  d.taskEnv,
+		Driver:   "java",
+		AllocDir: ctx.AllocDir,
+		AllocID:  ctx.AllocID,
+		Task:     task,
 	}
 
-	ps, err := exec.LaunchCmd(&executor.ExecCommand{Cmd: "java", Args: args}, executorCtx)
+	absPath, err := GetAbsolutePath("java")
+	if err != nil {
+		return nil, err
+	}
+
+	ps, err := execIntf.LaunchCmd(&executor.ExecCommand{
+		Cmd:            absPath,
+		Args:           args,
+		FSIsolation:    true,
+		ResourceLimits: true,
+		User:           getExecutorUser(task),
+	}, executorCtx)
 	if err != nil {
 		pluginClient.Kill()
-		return nil, fmt.Errorf("error starting process via the plugin: %v", err)
+		return nil, err
 	}
 	d.logger.Printf("[DEBUG] driver.java: started process with pid: %v", ps.Pid)
 
@@ -186,7 +205,7 @@ func (d *JavaDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, 
 	maxKill := d.DriverContext.config.MaxKillTimeout
 	h := &javaHandle{
 		pluginClient:    pluginClient,
-		executor:        exec,
+		executor:        execIntf,
 		userPid:         ps.Pid,
 		isolationConfig: ps.IsolationConfig,
 		taskDir:         taskDir,
@@ -198,7 +217,9 @@ func (d *JavaDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, 
 		doneCh:          make(chan struct{}),
 		waitCh:          make(chan *cstructs.WaitResult, 1),
 	}
-
+	if err := h.executor.SyncServices(consulContext(d.config, "")); err != nil {
+		d.logger.Printf("[ERR] driver.java: error registering services with consul for task: %q: %v", task.Name, err)
+	}
 	go h.run()
 	return h, nil
 }
@@ -239,7 +260,7 @@ func (d *JavaDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, erro
 			merrs.Errors = append(merrs.Errors, fmt.Errorf("error destroying plugin and userpid: %v", e))
 		}
 		if id.IsolationConfig != nil {
-			if e := executor.DestroyCgroup(id.IsolationConfig.Cgroup); e != nil {
+			if e := executor.DestroyCgroup(id.IsolationConfig.Cgroup, id.IsolationConfig.CgroupPaths); e != nil {
 				merrs.Errors = append(merrs.Errors, fmt.Errorf("destroying cgroup failed: %v", e))
 			}
 		}
@@ -249,6 +270,9 @@ func (d *JavaDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, erro
 
 		return nil, fmt.Errorf("error connecting to plugin: %v", merrs.ErrorOrNil())
 	}
+
+	ver, _ := exec.Version()
+	d.logger.Printf("[DEBUG] driver.java: version of executor: %v", ver.Version)
 
 	// Return a driver handle
 	h := &javaHandle{
@@ -264,6 +288,9 @@ func (d *JavaDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, erro
 		maxKillTimeout:  id.MaxKillTimeout,
 		doneCh:          make(chan struct{}),
 		waitCh:          make(chan *cstructs.WaitResult, 1),
+	}
+	if err := h.executor.SyncServices(consulContext(d.config, "")); err != nil {
+		d.logger.Printf("[ERR] driver.java: error registering services with consul: %v", err)
 	}
 
 	go h.run()
@@ -296,7 +323,7 @@ func (h *javaHandle) WaitCh() chan *cstructs.WaitResult {
 func (h *javaHandle) Update(task *structs.Task) error {
 	// Store the updated kill timeout.
 	h.killTimeout = GetKillTimeout(task.KillTimeout, h.maxKillTimeout)
-	h.executor.UpdateLogConfig(task.LogConfig)
+	h.executor.UpdateTask(task)
 
 	// Update is not possible
 	return nil
@@ -330,7 +357,7 @@ func (h *javaHandle) run() {
 	close(h.doneCh)
 	if ps.ExitCode == 0 && err != nil {
 		if h.isolationConfig != nil {
-			if e := executor.DestroyCgroup(h.isolationConfig.Cgroup); e != nil {
+			if e := executor.DestroyCgroup(h.isolationConfig.Cgroup, h.isolationConfig.CgroupPaths); e != nil {
 				h.logger.Printf("[ERR] driver.java: destroying cgroup failed while killing cgroup: %v", e)
 			}
 		} else {
@@ -342,7 +369,14 @@ func (h *javaHandle) run() {
 			h.logger.Printf("[ERR] driver.java: unmounting dev,proc and alloc dirs failed: %v", e)
 		}
 	}
-	h.waitCh <- &cstructs.WaitResult{ExitCode: ps.ExitCode, Signal: 0, Err: err}
+	h.waitCh <- &cstructs.WaitResult{ExitCode: ps.ExitCode, Signal: ps.Signal, Err: err}
 	close(h.waitCh)
+
+	// Remove services
+	if err := h.executor.DeregisterServices(); err != nil {
+		h.logger.Printf("[ERR] driver.java: failed to kill the deregister services: %v", err)
+	}
+
+	h.executor.Exit()
 	h.pluginClient.Kill()
 }

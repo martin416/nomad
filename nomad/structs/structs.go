@@ -2,10 +2,16 @@ package structs
 
 import (
 	"bytes"
+	"crypto/md5"
 	"crypto/sha1"
+	"crypto/sha256"
+	"crypto/sha512"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -674,10 +680,12 @@ func (r *Resources) Copy() *Resources {
 	}
 	newR := new(Resources)
 	*newR = *r
-	n := len(r.Networks)
-	newR.Networks = make([]*NetworkResource, n)
-	for i := 0; i < n; i++ {
-		newR.Networks[i] = r.Networks[i].Copy()
+	if r.Networks != nil {
+		n := len(r.Networks)
+		newR.Networks = make([]*NetworkResource, n)
+		for i := 0; i < n; i++ {
+			newR.Networks[i] = r.Networks[i].Copy()
+		}
 	}
 	return newR
 }
@@ -892,10 +900,6 @@ type Job struct {
 	// Periodic is used to define the interval the job is run at.
 	Periodic *PeriodicConfig
 
-	// GC is used to mark the job as available for garbage collection after it
-	// has no outstanding evaluations or allocations.
-	GC bool
-
 	// Meta is used to associate arbitrary metadata with this
 	// job. This is opaque to Nomad.
 	Meta map[string]string
@@ -918,11 +922,6 @@ func (j *Job) InitFields() {
 	for _, tg := range j.TaskGroups {
 		tg.InitFields(j)
 	}
-
-	// If the job is batch then make it GC.
-	if j.Type == JobTypeBatch {
-		j.GC = true
-	}
 }
 
 // Copy returns a deep copy of the Job. It is expected that callers use recover.
@@ -936,11 +935,13 @@ func (j *Job) Copy() *Job {
 	nj.Datacenters = CopySliceString(nj.Datacenters)
 	nj.Constraints = CopySliceConstraints(nj.Constraints)
 
-	tgs := make([]*TaskGroup, len(nj.TaskGroups))
-	for i, tg := range nj.TaskGroups {
-		tgs[i] = tg.Copy()
+	if j.TaskGroups != nil {
+		tgs := make([]*TaskGroup, len(nj.TaskGroups))
+		for i, tg := range nj.TaskGroups {
+			tgs[i] = tg.Copy()
+		}
+		nj.TaskGroups = tgs
 	}
-	nj.TaskGroups = tgs
 
 	nj.Periodic = nj.Periodic.Copy()
 	nj.Meta = CopyMapStringString(nj.Meta)
@@ -1311,11 +1312,13 @@ func (tg *TaskGroup) Copy() *TaskGroup {
 
 	ntg.RestartPolicy = ntg.RestartPolicy.Copy()
 
-	tasks := make([]*Task, len(ntg.Tasks))
-	for i, t := range ntg.Tasks {
-		tasks[i] = t.Copy()
+	if tg.Tasks != nil {
+		tasks := make([]*Task, len(ntg.Tasks))
+		for i, t := range ntg.Tasks {
+			tasks[i] = t.Copy()
+		}
+		ntg.Tasks = tasks
 	}
-	ntg.Tasks = tasks
 
 	ntg.Meta = CopyMapStringString(ntg.Meta)
 	return ntg
@@ -1339,8 +1342,8 @@ func (tg *TaskGroup) Validate() error {
 	if tg.Name == "" {
 		mErr.Errors = append(mErr.Errors, errors.New("Missing task group name"))
 	}
-	if tg.Count <= 0 {
-		mErr.Errors = append(mErr.Errors, errors.New("Task group count must be positive"))
+	if tg.Count < 0 {
+		mErr.Errors = append(mErr.Errors, errors.New("Task group count can't be negative"))
 	}
 	if len(tg.Tasks) == 0 {
 		mErr.Errors = append(mErr.Errors, errors.New("Missing tasks for task group"))
@@ -1408,7 +1411,8 @@ const (
 type ServiceCheck struct {
 	Name     string        // Name of the check, defaults to id
 	Type     string        // Type of the check - tcp, http, docker and script
-	Script   string        // Script to invoke for script check
+	Command  string        // Command is the command to run for script checks
+	Args     []string      // Args is a list of argumes for script checks
 	Path     string        // path of the health check url for http type check
 	Protocol string        // Protocol to use if check is http, defaults to http
 	Interval time.Duration // Interval of the check
@@ -1426,14 +1430,14 @@ func (sc *ServiceCheck) Copy() *ServiceCheck {
 
 func (sc *ServiceCheck) Validate() error {
 	t := strings.ToLower(sc.Type)
-	if t != ServiceCheckTCP && t != ServiceCheckHTTP {
-		return fmt.Errorf("service check must be either http or tcp type")
+	if t != ServiceCheckTCP && t != ServiceCheckHTTP && t != ServiceCheckScript {
+		return fmt.Errorf("service check must be either http, tcp or script type")
 	}
 	if sc.Type == ServiceCheckHTTP && sc.Path == "" {
 		return fmt.Errorf("service checks of http type must have a valid http path")
 	}
 
-	if sc.Type == ServiceCheckScript && sc.Script == "" {
+	if sc.Type == ServiceCheckScript && sc.Command == "" {
 		return fmt.Errorf("service checks of script type must have a valid script path")
 	}
 
@@ -1448,8 +1452,8 @@ func (sc *ServiceCheck) Hash(serviceID string) string {
 	io.WriteString(h, serviceID)
 	io.WriteString(h, sc.Name)
 	io.WriteString(h, sc.Type)
-	io.WriteString(h, sc.Script)
-	io.WriteString(h, sc.Path)
+	io.WriteString(h, sc.Command)
+	io.WriteString(h, strings.Join(sc.Args, ""))
 	io.WriteString(h, sc.Path)
 	io.WriteString(h, sc.Protocol)
 	io.WriteString(h, sc.Interval.String())
@@ -1477,14 +1481,14 @@ func (s *Service) Copy() *Service {
 	*ns = *s
 	ns.Tags = CopySliceString(ns.Tags)
 
-	var checks []*ServiceCheck
-	if l := len(ns.Checks); l != 0 {
-		checks = make([]*ServiceCheck, len(ns.Checks))
+	if s.Checks != nil {
+		checks := make([]*ServiceCheck, len(ns.Checks))
 		for i, c := range ns.Checks {
 			checks[i] = c.Copy()
 		}
+		ns.Checks = checks
 	}
-	ns.Checks = checks
+
 	return ns
 }
 
@@ -1506,14 +1510,21 @@ func (s *Service) InitFields(job string, taskGroup string, task string) {
 	}
 }
 
+func (s *Service) ID(allocID string, taskName string) string {
+	return fmt.Sprintf("%s-%s-%s-%s", NomadConsulPrefix, allocID, taskName, s.Hash())
+}
+
 // Validate checks if the Check definition is valid
 func (s *Service) Validate() error {
 	var mErr multierror.Error
 
-	// Ensure the name does not have a period in it.
-	// RFC-2782: https://tools.ietf.org/html/rfc2782
-	if strings.Contains(s.Name, ".") {
-		mErr.Errors = append(mErr.Errors, fmt.Errorf("service name can't contain periods: %q", s.Name))
+	// Ensure the service name is valid per RFC-952 §1
+	// (https://tools.ietf.org/html/rfc952), RFC-1123 §2.1
+	// (https://tools.ietf.org/html/rfc1123), and RFC-2782
+	// (https://tools.ietf.org/html/rfc2782).
+	re := regexp.MustCompile(`^(?i:[a-z0-9]|[a-z0-9][a-z0-9\-]{0,61}[a-z0-9])$`)
+	if !re.MatchString(s.Name) {
+		mErr.Errors = append(mErr.Errors, fmt.Errorf("service name must be valid per RFC 1123 and can contain only alphanumeric characters or dashes and must be less than 63 characters long: %q", s.Name))
 	}
 
 	for _, c := range s.Checks {
@@ -1574,6 +1585,10 @@ type Task struct {
 	// Driver is used to control which driver is used
 	Driver string
 
+	// User is used to determine which user will run the task. It defaults to
+	// the same user the Nomad client is being run as.
+	User string
+
 	// Config is provided to the driver to initialize
 	Config map[string]interface{}
 
@@ -1600,6 +1615,10 @@ type Task struct {
 
 	// LogConfig provides configuration for log rotation
 	LogConfig *LogConfig `mapstructure:"logs"`
+
+	// Artifacts is a list of artifacts to download and extract before running
+	// the task.
+	Artifacts []*TaskArtifact
 }
 
 func (t *Task) Copy() *Task {
@@ -1610,15 +1629,26 @@ func (t *Task) Copy() *Task {
 	*nt = *t
 	nt.Env = CopyMapStringString(nt.Env)
 
-	services := make([]*Service, len(nt.Services))
-	for i, s := range nt.Services {
-		services[i] = s.Copy()
+	if t.Services != nil {
+		services := make([]*Service, len(nt.Services))
+		for i, s := range nt.Services {
+			services[i] = s.Copy()
+		}
+		nt.Services = services
 	}
-	nt.Services = services
+
 	nt.Constraints = CopySliceConstraints(nt.Constraints)
 
 	nt.Resources = nt.Resources.Copy()
 	nt.Meta = CopyMapStringString(nt.Meta)
+
+	if t.Artifacts != nil {
+		artifacts := make([]*TaskArtifact, 0, len(t.Artifacts))
+		for _, a := range nt.Artifacts {
+			artifacts = append(artifacts, a.Copy())
+		}
+		nt.Artifacts = artifacts
+	}
 
 	if i, err := copystructure.Copy(nt.Config); err != nil {
 		nt.Config = i.(map[string]interface{})
@@ -1659,6 +1689,72 @@ func (t *Task) FindHostAndPortFor(portLabel string) (string, int) {
 	return "", 0
 }
 
+// Validate is used to sanity check a task
+func (t *Task) Validate() error {
+	var mErr multierror.Error
+	if t.Name == "" {
+		mErr.Errors = append(mErr.Errors, errors.New("Missing task name"))
+	}
+	if t.Driver == "" {
+		mErr.Errors = append(mErr.Errors, errors.New("Missing task driver"))
+	}
+	if t.KillTimeout.Nanoseconds() < 0 {
+		mErr.Errors = append(mErr.Errors, errors.New("KillTimeout must be a positive value"))
+	}
+
+	// Validate the resources.
+	if t.Resources == nil {
+		mErr.Errors = append(mErr.Errors, errors.New("Missing task resources"))
+	} else if err := t.Resources.MeetsMinResources(); err != nil {
+		mErr.Errors = append(mErr.Errors, err)
+	}
+
+	// Validate the log config
+	if t.LogConfig == nil {
+		mErr.Errors = append(mErr.Errors, errors.New("Missing Log Config"))
+	} else if err := t.LogConfig.Validate(); err != nil {
+		mErr.Errors = append(mErr.Errors, err)
+	}
+
+	for idx, constr := range t.Constraints {
+		if err := constr.Validate(); err != nil {
+			outer := fmt.Errorf("Constraint %d validation failed: %s", idx+1, err)
+			mErr.Errors = append(mErr.Errors, outer)
+		}
+	}
+
+	for _, service := range t.Services {
+		if err := service.Validate(); err != nil {
+			mErr.Errors = append(mErr.Errors, err)
+		}
+	}
+
+	if t.LogConfig != nil && t.Resources != nil {
+		logUsage := (t.LogConfig.MaxFiles * t.LogConfig.MaxFileSizeMB)
+		if t.Resources.DiskMB <= logUsage {
+			mErr.Errors = append(mErr.Errors,
+				fmt.Errorf("log storage (%d MB) must be less than requested disk capacity (%d MB)",
+					logUsage, t.Resources.DiskMB))
+		}
+	}
+
+	for idx, artifact := range t.Artifacts {
+		if err := artifact.Validate(); err != nil {
+			outer := fmt.Errorf("Artifact %d validation failed: %v", idx+1, err)
+			mErr.Errors = append(mErr.Errors, outer)
+		}
+	}
+
+	// If the driver is java or qemu ensure that they have specified an
+	// artifact.
+	if (t.Driver == "qemu" || t.Driver == "java") && len(t.Artifacts) == 0 {
+		err := fmt.Errorf("must specify at least one artifact when using %q driver", t.Driver)
+		mErr.Errors = append(mErr.Errors, err)
+	}
+
+	return mErr.ErrorOrNil()
+}
+
 // Set of possible states for a task.
 const (
 	TaskStatePending = "pending" // The task is waiting to be run.
@@ -1682,9 +1778,12 @@ func (ts *TaskState) Copy() *TaskState {
 	}
 	copy := new(TaskState)
 	copy.State = ts.State
-	copy.Events = make([]*TaskEvent, len(ts.Events))
-	for i, e := range ts.Events {
-		copy.Events[i] = e.Copy()
+
+	if ts.Events != nil {
+		copy.Events = make([]*TaskEvent, len(ts.Events))
+		for i, e := range ts.Events {
+			copy.Events[i] = e.Copy()
+		}
 	}
 	return copy
 }
@@ -1696,26 +1795,35 @@ func (ts *TaskState) Failed() bool {
 		return false
 	}
 
-	return ts.Events[l-1].Type == TaskNotRestarting
+	switch ts.Events[l-1].Type {
+	case TaskNotRestarting, TaskArtifactDownloadFailed, TaskFailedValidation:
+		return true
+	default:
+		return false
+	}
 }
 
 const (
-	// A Driver failure indicates that the task could not be started due to a
+	// TaskDriveFailure indicates that the task could not be started due to a
 	// failure in the driver.
 	TaskDriverFailure = "Driver Failure"
 
-	// Task Received signals that the task has been pulled by the client at the
+	// TaskReceived signals that the task has been pulled by the client at the
 	// given timestamp.
 	TaskReceived = "Received"
 
-	// Task Started signals that the task was started and its timestamp can be
+	// TaskFailedValidation indicates the task was invalid and as such was not
+	// run.
+	TaskFailedValidation = "Failed Validation"
+
+	// TaskStarted signals that the task was started and its timestamp can be
 	// used to determine the running length of the task.
 	TaskStarted = "Started"
 
-	// Task terminated indicates that the task was started and exited.
+	// TaskTerminated indicates that the task was started and exited.
 	TaskTerminated = "Terminated"
 
-	// Task Killed indicates a user has killed the task.
+	// TaskKilled indicates a user has killed the task.
 	TaskKilled = "Killed"
 
 	// TaskRestarting indicates that task terminated and is being restarted.
@@ -1723,7 +1831,15 @@ const (
 
 	// TaskNotRestarting indicates that the task has failed and is not being
 	// restarted because it has exceeded its restart policy.
-	TaskNotRestarting = "Restarts Exceeded"
+	TaskNotRestarting = "Not Restarting"
+
+	// TaskDownloadingArtifacts means the task is downloading the artifacts
+	// specified in the task.
+	TaskDownloadingArtifacts = "Downloading Artifacts"
+
+	// TaskArtifactDownloadFailed indicates that downloading the artifacts
+	// failed.
+	TaskArtifactDownloadFailed = "Failed Artifact Download"
 )
 
 // TaskEvent is an event that effects the state of a task and contains meta-data
@@ -1731,6 +1847,9 @@ const (
 type TaskEvent struct {
 	Type string
 	Time int64 // Unix Nanosecond timestamp
+
+	// Restart fields.
+	RestartReason string
 
 	// Driver Failure fields.
 	DriverError string // A driver error occured while starting the task.
@@ -1745,6 +1864,12 @@ type TaskEvent struct {
 
 	// TaskRestarting fields.
 	StartDelay int64 // The sleep period before restarting the task in unix nanoseconds.
+
+	// Artifact Download fields
+	DownloadError string // Error downloading artifacts
+
+	// Validation fields
+	ValidationError string // Validation error
 }
 
 func (te *TaskEvent) GoString() string {
@@ -1803,54 +1928,128 @@ func (e *TaskEvent) SetRestartDelay(delay time.Duration) *TaskEvent {
 	return e
 }
 
-// Validate is used to sanity check a task group
-func (t *Task) Validate() error {
+func (e *TaskEvent) SetRestartReason(reason string) *TaskEvent {
+	e.RestartReason = reason
+	return e
+}
+
+func (e *TaskEvent) SetDownloadError(err error) *TaskEvent {
+	if err != nil {
+		e.DownloadError = err.Error()
+	}
+	return e
+}
+
+func (e *TaskEvent) SetValidationError(err error) *TaskEvent {
+	if err != nil {
+		e.ValidationError = err.Error()
+	}
+	return e
+}
+
+// TaskArtifact is an artifact to download before running the task.
+type TaskArtifact struct {
+	// GetterSource is the source to download an artifact using go-getter
+	GetterSource string `mapstructure:"source"`
+
+	// GetterOptions are options to use when downloading the artifact using
+	// go-getter.
+	GetterOptions map[string]string `mapstructure:"options"`
+
+	// RelativeDest is the download destination given relative to the task's
+	// directory.
+	RelativeDest string `mapstructure:"destination"`
+}
+
+func (ta *TaskArtifact) Copy() *TaskArtifact {
+	if ta == nil {
+		return nil
+	}
+	nta := new(TaskArtifact)
+	*nta = *ta
+	nta.GetterOptions = CopyMapStringString(ta.GetterOptions)
+	return nta
+}
+
+func (ta *TaskArtifact) GoString() string {
+	return fmt.Sprintf("%+v", ta)
+}
+
+func (ta *TaskArtifact) Validate() error {
+	// Verify the source
 	var mErr multierror.Error
-	if t.Name == "" {
-		mErr.Errors = append(mErr.Errors, errors.New("Missing task name"))
-	}
-	if t.Driver == "" {
-		mErr.Errors = append(mErr.Errors, errors.New("Missing task driver"))
-	}
-	if t.KillTimeout.Nanoseconds() < 0 {
-		mErr.Errors = append(mErr.Errors, errors.New("KillTimeout must be a positive value"))
+	if ta.GetterSource == "" {
+		mErr.Errors = append(mErr.Errors, fmt.Errorf("source must be specified"))
+	} else {
+		_, err := url.Parse(ta.GetterSource)
+		if err != nil {
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("invalid source URL %q: %v", ta.GetterSource, err))
+		}
 	}
 
-	// Validate the resources.
-	if t.Resources == nil {
-		mErr.Errors = append(mErr.Errors, errors.New("Missing task resources"))
-	} else if err := t.Resources.MeetsMinResources(); err != nil {
+	// Verify the destination doesn't escape the tasks directory
+	alloc, err := filepath.Abs(filepath.Join("/", "foo/", "bar/"))
+	if err != nil {
 		mErr.Errors = append(mErr.Errors, err)
+		return mErr.ErrorOrNil()
 	}
-
-	// Validate the log config
-	if t.LogConfig == nil {
-		mErr.Errors = append(mErr.Errors, errors.New("Missing Log Config"))
-	} else if err := t.LogConfig.Validate(); err != nil {
+	abs, err := filepath.Abs(filepath.Join(alloc, ta.RelativeDest))
+	if err != nil {
 		mErr.Errors = append(mErr.Errors, err)
+		return mErr.ErrorOrNil()
+	}
+	rel, err := filepath.Rel(alloc, abs)
+	if err != nil {
+		mErr.Errors = append(mErr.Errors, err)
+		return mErr.ErrorOrNil()
+	}
+	if strings.HasPrefix(rel, "..") {
+		mErr.Errors = append(mErr.Errors, fmt.Errorf("destination escapes task's directory"))
 	}
 
-	for idx, constr := range t.Constraints {
-		if err := constr.Validate(); err != nil {
-			outer := fmt.Errorf("Constraint %d validation failed: %s", idx+1, err)
-			mErr.Errors = append(mErr.Errors, outer)
+	// Verify the checksum
+	if check, ok := ta.GetterOptions["checksum"]; ok {
+		check = strings.TrimSpace(check)
+		if check == "" {
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("checksum value can not be empty"))
+			return mErr.ErrorOrNil()
+		}
+
+		parts := strings.Split(check, ":")
+		if l := len(parts); l != 2 {
+			mErr.Errors = append(mErr.Errors, fmt.Errorf(`checksum must be given as "type:value"; got %q`, check))
+			return mErr.ErrorOrNil()
+		}
+
+		checksumVal := parts[1]
+		checksumBytes, err := hex.DecodeString(checksumVal)
+		if err != nil {
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("invalid checksum: %v", err))
+			return mErr.ErrorOrNil()
+		}
+
+		checksumType := parts[0]
+		expectedLength := 0
+		switch checksumType {
+		case "md5":
+			expectedLength = md5.Size
+		case "sha1":
+			expectedLength = sha1.Size
+		case "sha256":
+			expectedLength = sha256.Size
+		case "sha512":
+			expectedLength = sha512.Size
+		default:
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("unsupported checksum type: %s", checksumType))
+			return mErr.ErrorOrNil()
+		}
+
+		if len(checksumBytes) != expectedLength {
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("invalid %s checksum: %v", checksumType, checksumVal))
+			return mErr.ErrorOrNil()
 		}
 	}
 
-	for _, service := range t.Services {
-		if err := service.Validate(); err != nil {
-			mErr.Errors = append(mErr.Errors, err)
-		}
-	}
-
-	if t.LogConfig != nil && t.Resources != nil {
-		logUsage := (t.LogConfig.MaxFiles * t.LogConfig.MaxFileSizeMB)
-		if t.Resources.DiskMB <= logUsage {
-			mErr.Errors = append(mErr.Errors,
-				fmt.Errorf("log storage (%d MB) exceeds requested disk capacity (%d MB)",
-					logUsage, t.Resources.DiskMB))
-		}
-	}
 	return mErr.ErrorOrNil()
 }
 
@@ -1913,10 +2112,10 @@ const (
 )
 
 const (
-	AllocClientStatusPending = "pending"
-	AllocClientStatusRunning = "running"
-	AllocClientStatusDead    = "dead"
-	AllocClientStatusFailed  = "failed"
+	AllocClientStatusPending  = "pending"
+	AllocClientStatusRunning  = "running"
+	AllocClientStatusComplete = "complete"
+	AllocClientStatusFailed   = "failed"
 )
 
 // Allocation is used to allocate the placement of a task group to a node.
@@ -1994,25 +2193,31 @@ func (a *Allocation) Copy() *Allocation {
 	na.Job = na.Job.Copy()
 	na.Resources = na.Resources.Copy()
 
-	tr := make(map[string]*Resources, len(na.TaskResources))
-	for task, resource := range na.TaskResources {
-		tr[task] = resource.Copy()
+	if a.TaskResources != nil {
+		tr := make(map[string]*Resources, len(na.TaskResources))
+		for task, resource := range na.TaskResources {
+			tr[task] = resource.Copy()
+		}
+		na.TaskResources = tr
 	}
-	na.TaskResources = tr
 
-	s := make(map[string]string, len(na.Services))
-	for service, id := range na.Services {
-		s[service] = id
+	if a.Services != nil {
+		s := make(map[string]string, len(na.Services))
+		for service, id := range na.Services {
+			s[service] = id
+		}
+		na.Services = s
 	}
-	na.Services = s
 
 	na.Metrics = na.Metrics.Copy()
 
-	ts := make(map[string]*TaskState, len(na.TaskStates))
-	for task, state := range na.TaskStates {
-		ts[task] = state.Copy()
+	if a.TaskStates != nil {
+		ts := make(map[string]*TaskState, len(na.TaskStates))
+		for task, state := range na.TaskStates {
+			ts[task] = state.Copy()
+		}
+		na.TaskStates = ts
 	}
-	na.TaskStates = ts
 	return na
 }
 
@@ -2023,12 +2228,6 @@ func (a *Allocation) TerminalStatus() bool {
 	// state.
 	switch a.DesiredStatus {
 	case AllocDesiredStatusStop, AllocDesiredStatusEvict, AllocDesiredStatusFailed:
-		return true
-	default:
-	}
-
-	switch a.ClientStatus {
-	case AllocClientStatusDead, AllocClientStatusFailed:
 		return true
 	default:
 		return false

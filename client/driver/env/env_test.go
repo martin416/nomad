@@ -2,8 +2,10 @@ package env
 
 import (
 	"fmt"
+	"os"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/nomad/nomad/mock"
@@ -138,7 +140,8 @@ func TestEnvironment_AsList(t *testing.T) {
 	env := NewTaskEnvironment(n).
 		SetNetworks(networks).
 		SetPortMap(portMap).
-		SetMeta(map[string]string{"foo": "baz"}).Build()
+		SetTaskGroupMeta(map[string]string{"foo": "bar", "baz": "bam"}).
+		SetTaskMeta(map[string]string{"foo": "baz"}).Build()
 
 	act := env.EnvList()
 	exp := []string{
@@ -146,6 +149,7 @@ func TestEnvironment_AsList(t *testing.T) {
 		"NOMAD_ADDR_https=127.0.0.1:443",
 		"NOMAD_HOST_PORT_https=443",
 		"NOMAD_META_FOO=baz",
+		"NOMAD_META_BAZ=bam",
 	}
 	sort.Strings(act)
 	sort.Strings(exp)
@@ -198,6 +202,45 @@ func TestEnvironment_Interprolate(t *testing.T) {
 
 	act := env.EnvList()
 	exp := []string{fmt.Sprintf("test=%s", nodeClass), fmt.Sprintf("test2=%s", attrVal)}
+	sort.Strings(act)
+	sort.Strings(exp)
+	if !reflect.DeepEqual(act, exp) {
+		t.Fatalf("env.List() returned %v; want %v", act, exp)
+	}
+}
+
+func TestEnvironment_AppendHostEnvVars(t *testing.T) {
+	host := os.Environ()
+	if len(host) < 2 {
+		t.Skip("No host environment variables. Can't test")
+	}
+	skip := strings.Split(host[0], "=")[0]
+	env := testTaskEnvironment().
+		AppendHostEnvvars([]string{skip}).
+		Build()
+
+	act := env.EnvMap()
+	if len(act) < 1 {
+		t.Fatalf("Host environment variables not properly set")
+	}
+	if _, ok := act[skip]; ok {
+		t.Fatalf("Didn't filter environment variable %q", skip)
+	}
+}
+
+func TestEnvironment_MetaPrecedence(t *testing.T) {
+	n := mock.Node()
+	env := NewTaskEnvironment(n).
+		SetJobMeta(map[string]string{"foo": "job", "bar": "job", "baz": "job"}).
+		SetTaskGroupMeta(map[string]string{"foo": "tg", "bar": "tg"}).
+		SetTaskMeta(map[string]string{"foo": "task"}).Build()
+
+	act := env.EnvList()
+	exp := []string{
+		"NOMAD_META_FOO=task",
+		"NOMAD_META_BAR=tg",
+		"NOMAD_META_BAZ=job",
+	}
 	sort.Strings(act)
 	sort.Strings(exp)
 	if !reflect.DeepEqual(act, exp) {

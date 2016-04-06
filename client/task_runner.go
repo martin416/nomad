@@ -13,8 +13,8 @@ import (
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/nomad/client/config"
 	"github.com/hashicorp/nomad/client/driver"
+	"github.com/hashicorp/nomad/client/getter"
 	"github.com/hashicorp/nomad/nomad/structs"
-	"github.com/mitchellh/hashstructure"
 
 	cstructs "github.com/hashicorp/nomad/client/driver/structs"
 )
@@ -41,12 +41,15 @@ type TaskRunner struct {
 	ctx            *driver.ExecContext
 	alloc          *structs.Allocation
 	restartTracker *RestartTracker
-	consulService  *ConsulService
 
 	task       *structs.Task
 	updateCh   chan *structs.Allocation
 	handle     driver.DriverHandle
 	handleLock sync.Mutex
+
+	// artifactsDownloaded tracks whether the tasks artifacts have been
+	// downloaded
+	artifactsDownloaded bool
 
 	destroy     bool
 	destroyCh   chan struct{}
@@ -56,9 +59,10 @@ type TaskRunner struct {
 
 // taskRunnerState is used to snapshot the state of the task runner
 type taskRunnerState struct {
-	Version  string
-	Task     *structs.Task
-	HandleID string
+	Version            string
+	Task               *structs.Task
+	HandleID           string
+	ArtifactDownloaded bool
 }
 
 // TaskStateUpdater is used to signal that tasks state has changed.
@@ -67,8 +71,7 @@ type TaskStateUpdater func(taskName, state string, event *structs.TaskEvent)
 // NewTaskRunner is used to create a new task context
 func NewTaskRunner(logger *log.Logger, config *config.Config,
 	updater TaskStateUpdater, ctx *driver.ExecContext,
-	alloc *structs.Allocation, task *structs.Task,
-	consulService *ConsulService) *TaskRunner {
+	alloc *structs.Allocation, task *structs.Task) *TaskRunner {
 
 	// Merge in the task resources
 	task.Resources = alloc.TaskResources[task.Name]
@@ -86,7 +89,6 @@ func NewTaskRunner(logger *log.Logger, config *config.Config,
 		updater:        updater,
 		logger:         logger,
 		restartTracker: restartTracker,
-		consulService:  consulService,
 		ctx:            ctx,
 		alloc:          alloc,
 		task:           task,
@@ -95,9 +97,12 @@ func NewTaskRunner(logger *log.Logger, config *config.Config,
 		waitCh:         make(chan struct{}),
 	}
 
-	// Set the state to pending.
-	tc.updater(task.Name, structs.TaskStatePending, structs.NewTaskEvent(structs.TaskReceived))
 	return tc
+}
+
+// MarkReceived marks the task as received.
+func (r *TaskRunner) MarkReceived() {
+	r.updater(r.task.Name, structs.TaskStatePending, structs.NewTaskEvent(structs.TaskReceived))
 }
 
 // WaitCh returns a channel to wait for termination
@@ -128,6 +133,7 @@ func (r *TaskRunner) RestoreState() error {
 
 	// Restore fields
 	r.task = snap.Task
+	r.artifactsDownloaded = snap.ArtifactDownloaded
 
 	// Restore the driver
 	if snap.HandleID != "" {
@@ -154,8 +160,9 @@ func (r *TaskRunner) RestoreState() error {
 // SaveState is used to snapshot our state
 func (r *TaskRunner) SaveState() error {
 	snap := taskRunnerState{
-		Task:    r.task,
-		Version: r.config.Version,
+		Task:               r.task,
+		Version:            r.config.Version,
+		ArtifactDownloaded: r.artifactsDownloaded,
 	}
 	r.handleLock.Lock()
 	if r.handle != nil {
@@ -209,17 +216,83 @@ func (r *TaskRunner) Run() {
 	r.logger.Printf("[DEBUG] client: starting task context for '%s' (alloc '%s')",
 		r.task.Name, r.alloc.ID)
 
+	if err := r.validateTask(); err != nil {
+		r.setState(
+			structs.TaskStateDead,
+			structs.NewTaskEvent(structs.TaskFailedValidation).SetValidationError(err))
+		return
+	}
+
 	r.run()
 	return
 }
 
+// validateTask validates the fields of the task and returns an error if the
+// task is invalid.
+func (r *TaskRunner) validateTask() error {
+	var mErr multierror.Error
+
+	// Validate the user.
+	unallowedUsers := r.config.ReadStringListToMapDefault("user.blacklist", config.DefaultUserBlacklist)
+	checkDrivers := r.config.ReadStringListToMapDefault("user.checked_drivers", config.DefaultUserCheckedDrivers)
+	if _, driverMatch := checkDrivers[r.task.Driver]; driverMatch {
+		if _, unallowed := unallowedUsers[r.task.User]; unallowed {
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("running as user %q is disallowed", r.task.User))
+		}
+	}
+
+	// Validate the artifacts
+	for i, artifact := range r.task.Artifacts {
+		// Verify the artifact doesn't escape the task directory.
+		if err := artifact.Validate(); err != nil {
+			// If this error occurs there is potentially a server bug or
+			// mallicious, server spoofing.
+			r.logger.Printf("[ERR] client: allocation %q, task %v, artifact %#v (%v) fails validation: %v",
+				r.alloc.ID, r.task.Name, artifact, i, err)
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("artifact (%d) failed validation: %v", i, err))
+		}
+	}
+
+	if len(mErr.Errors) == 1 {
+		return mErr.Errors[0]
+	}
+	return mErr.ErrorOrNil()
+}
+
 func (r *TaskRunner) run() {
+	// Predeclare things so we an jump to the RESTART
+	var handleEmpty bool
+
 	for {
+		// Download the task's artifacts
+		if !r.artifactsDownloaded && len(r.task.Artifacts) > 0 {
+			r.setState(structs.TaskStatePending, structs.NewTaskEvent(structs.TaskDownloadingArtifacts))
+			taskDir, ok := r.ctx.AllocDir.TaskDirs[r.task.Name]
+			if !ok {
+				err := fmt.Errorf("task directory couldn't be found")
+				r.setState(structs.TaskStateDead, structs.NewTaskEvent(structs.TaskDriverFailure).SetDriverError(err))
+				r.logger.Printf("[ERR] client: task directory for alloc %q task %q couldn't be found", r.alloc.ID, r.task.Name)
+				r.restartTracker.SetStartError(err)
+				goto RESTART
+			}
+
+			for _, artifact := range r.task.Artifacts {
+				if err := getter.GetArtifact(artifact, taskDir, r.logger); err != nil {
+					r.setState(structs.TaskStateDead,
+						structs.NewTaskEvent(structs.TaskArtifactDownloadFailed).SetDownloadError(err))
+					r.restartTracker.SetStartError(cstructs.NewRecoverableError(err, true))
+					goto RESTART
+				}
+			}
+
+			r.artifactsDownloaded = true
+		}
+
 		// Start the task if not yet started or it is being forced. This logic
 		// is necessary because in the case of a restore the handle already
 		// exists.
 		r.handleLock.Lock()
-		handleEmpty := r.handle == nil
+		handleEmpty = r.handle == nil
 		r.handleLock.Unlock()
 		if handleEmpty {
 			startErr := r.startTask()
@@ -230,18 +303,14 @@ func (r *TaskRunner) run() {
 			}
 		}
 
-		// Mark the task as started and register it with Consul.
+		// Mark the task as started
 		r.setState(structs.TaskStateRunning, structs.NewTaskEvent(structs.TaskStarted))
-		r.consulService.Register(r.task, r.alloc)
 
 		// Wait for updates
 	WAIT:
 		for {
 			select {
 			case waitRes := <-r.handle.WaitCh():
-				// De-Register the services belonging to the task from consul
-				r.consulService.Deregister(r.task, r.alloc)
-
 				if waitRes == nil {
 					panic("nil wait")
 				}
@@ -270,23 +339,29 @@ func (r *TaskRunner) run() {
 
 				// Store that the task has been destroyed and any associated error.
 				r.setState(structs.TaskStateDead, structs.NewTaskEvent(structs.TaskKilled).SetKillError(err))
-				r.consulService.Deregister(r.task, r.alloc)
 				return
 			}
 		}
 
 	RESTART:
 		state, when := r.restartTracker.GetState()
+		r.restartTracker.SetStartError(nil).SetWaitResult(nil)
+		reason := r.restartTracker.GetReason()
 		switch state {
 		case structs.TaskNotRestarting, structs.TaskTerminated:
 			r.logger.Printf("[INFO] client: Not restarting task: %v for alloc: %v ", r.task.Name, r.alloc.ID)
 			if state == structs.TaskNotRestarting {
-				r.setState(structs.TaskStateDead, structs.NewTaskEvent(structs.TaskNotRestarting))
+				r.setState(structs.TaskStateDead,
+					structs.NewTaskEvent(structs.TaskNotRestarting).
+						SetRestartReason(reason))
 			}
 			return
 		case structs.TaskRestarting:
 			r.logger.Printf("[INFO] client: Restarting task %q for alloc %q in %v", r.task.Name, r.alloc.ID, when)
-			r.setState(structs.TaskStatePending, structs.NewTaskEvent(structs.TaskRestarting).SetRestartDelay(when))
+			r.setState(structs.TaskStatePending,
+				structs.NewTaskEvent(structs.TaskRestarting).
+					SetRestartDelay(when).
+					SetRestartReason(reason))
 		default:
 			r.logger.Printf("[ERR] client: restart tracker returned unknown state: %q", state)
 			return
@@ -374,22 +449,6 @@ func (r *TaskRunner) handleUpdate(update *structs.Allocation) error {
 	// Update the restart policy.
 	if r.restartTracker != nil {
 		r.restartTracker.SetPolicy(tg.RestartPolicy)
-	}
-
-	// Hash services returns the hash of the task's services
-	hashServices := func(task *structs.Task) uint64 {
-		h, err := hashstructure.Hash(task.Services, nil)
-		if err != nil {
-			mErr.Errors = append(mErr.Errors, fmt.Errorf("hashing services failed %#v: %v", task.Services, err))
-		}
-		return h
-	}
-
-	// Re-register the task to consul if any of the services have changed.
-	if hashServices(updatedTask) != hashServices(r.task) {
-		if err := r.consulService.Register(updatedTask, update); err != nil {
-			mErr.Errors = append(mErr.Errors, fmt.Errorf("updating services with consul failed: %v", err))
-		}
 	}
 
 	// Store the updated alloc.

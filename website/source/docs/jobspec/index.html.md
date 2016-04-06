@@ -137,7 +137,7 @@ The `job` object supports the following keys:
 
 * `priority` - Specifies the job priority which is used to prioritize
   scheduling and access to resources. Must be between 1 and 100 inclusively,
-  and defaults to 50.
+  with a larger value corresponding to a higher priority. Defaults to 50.
 
 * `region` - The region to run the job in, defaults to "global".
 
@@ -228,6 +228,9 @@ The `task` object supports the following keys:
   task. See the [driver documentation](/docs/drivers/index.html) for what
   is available. Examples include `docker`, `qemu`, `java`, and `exec`.
 
+* `user` - Set the user that will run the task. It defaults to the same user
+  the Nomad client is being run as.
+
 * `constraint` - This can be provided multiple times to define additional
   constraints. See the constraint reference for more details.
 
@@ -257,7 +260,7 @@ The `task` object supports the following keys:
     ```
 
 * `resources` - Provides the resource requirements of the task.
-  See the resources reference for more details.
+  See the [resources reference](#resources) for more details.
 
 * `meta` - Annotates the task group with opaque metadata.
 
@@ -268,23 +271,27 @@ The `task` object supports the following keys:
 * `logs` - Logs allows configuring log rotation for the `stdout` and `stderr`
   buffers of a Task. See the log rotation reference below for more details.
 
+* `artifact` - Defines an artifact to be downloaded before the task is run. This
+  can be provided multiple times to define additional artifacts to download. See
+  the artifacts reference for more details.
+
 ### Resources
 
 The `resources` object supports the following keys:
 
-* `cpu` - The CPU required in MHz.
+* `cpu` - The CPU required in MHz. Defaults to `100`.
 
-* `disk` - The disk required in MB.
+* `disk` - The disk required in MB. Defaults to `200`.
 
-* `iops` - The number of IOPS required given as a weight between 10-1000.
+* `iops` - The number of IOPS required given as a weight between 10-1000. Defaults to `0`.
 
-* `memory` - The memory required in MB.
+* `memory` - The memory required in MB. Defaults to `300`.
 
 * `network` - The network required. Details below.
 
 The `network` object supports the following keys:
 
-* `mbits` - The number of MBits in bandwidth required.
+* `mbits` (required) - The number of MBits in bandwidth required.
 
 *   `port` - `port` is a repeatable object that can be used to specify both
     dynamic ports and reserved ports. It has the following format:
@@ -349,16 +356,19 @@ The `constraint` object supports the following keys:
 * `attribute` - Specifies the attribute to examine for the
   constraint. See the table of attributes [here](/docs/jobspec/interpreted.html#interpreted_node_vars).
 
-* `operator` - Specifies the comparison operator. Defaults to equality,
-  and can be `=`, `==`, `is`, `!=`, `not`, `>`, `>=`, `<`, `<=`. The
-  ordering is compared lexically.
+*   `operator` - Specifies the comparison operator. Defaults to equality,
+    and can be `=`, `==`, `is`, `!=`, `not`, `>`, `>=`, `<`, `<=`. The
+    ordering is compared lexically. The following are equivalent:
+
+      * `=`, `==` and `is`
+      * `!=` and `not`
 
 * `value` - Specifies the value to compare the attribute against.
   This can be a literal value or another attribute.
 
 * `version` - Specifies a version constraint against the attribute.
   This sets the operator to `version` and the `value` to what is
-  specified. This supports a comma seperated list of constraints,
+  specified. This supports a comma separated list of constraints,
   including the pessimistic operator. See the
   [go-version](https://github.com/hashicorp/go-version) repository
   for examples.
@@ -367,17 +377,15 @@ The `constraint` object supports the following keys:
   the attribute. This sets the operator to "regexp" and the `value`
   to the regular expression.
 
-*   `distinct_hosts` - `distinct_hosts` accepts a boolean `true`. The default is
-    `false`.
+*   `distinct_hosts` - `distinct_hosts` accepts a boolean value and defaults to
+    `false`. If set, the scheduler will not co-locate any task groups on the same
+    machine. This can be specified as a job constraint which applies the
+    constraint to all task groups in the job, or as a task group constraint which
+    scopes the effect to just that group.
 
-    When `distinct_hosts` is `true` at the Job level, each instance of all task
-    Groups specified in the job is placed on a separate host.
-
-    When `distinct_hosts` is `true` at the task group level with count > 1, each
-    instance of a task group is placed on a separate host. Different task groups in
-    the same job _may_ be co-scheduled.
-
-    Tasks within a task group are always co-scheduled.
+    Placing the constraint at both the job level and at the task group level is
+    redundant since when placed at the job level, the constraint will be applied
+    to all task groups.
 
 ### Log Rotation
 
@@ -405,12 +413,69 @@ In the above example we have asked Nomad to retain 3 rotated files for both
 `stderr` and `stdout` and size of each file is 10MB. The minimum disk space that
 would be required for the task would be 60MB.
 
+### Artifact
+
+<a id="artifact_doc"></a>
+
+Nomad downloads artifacts using
+[`go-getter`](https://github.com/hashicorp/go-getter). The `go-getter` library
+allows downloading of artifacts from various sources using a URL as the input
+source. The key/value pairs given in the `options` block map directly to
+parameters appended to the supplied `source` url. These are then used by
+`go-getter` to appropriately download the artifact. `go-getter` also has a CLI
+tool to validate its URL and can be used to check if the Nomad `artifact` is
+valid.
+
+Nomad allows downloading `http`, `https`, and `S3` artifacts. If these artifacts
+are archives (zip, tar.gz, bz2, etc.), these will be unarchived before the task
+is started.
+
+The `artifact` object maps supports the following keys:
+
+* `source` - The path to the artifact to download.
+
+* `destination` - An optional path to download the artifact into relative to the
+  root of the task's directory. If the `destination` key is omitted, it will
+  default to `local/`.
+
+* `options` - The `options` block allows setting parameters for `go-getter`.
+  Full documentation of supported options are available
+  [here](https://github.com/hashicorp/go-getter/tree/ef5edd3d8f6f482b775199be2f3734fd20e04d4a#protocol-specific-options-1).
+  An example is given below:
+
+```
+options {
+    # Validate the downloaded artifact
+    checksum = "md5:c4aa853ad2215426eb7d70a21922e794"
+
+    # S3 options for downloading artifacts from S3
+    aws_access_key_id     = "<id>"
+    aws_access_key_secret = "<secret>"
+    aws_access_token      = "<token>"
+}
+```
+
+An example of downloading and unzipping an archive is as simple as:
+
+```
+artifact {
+  # The archive will be extracted before the task is run, making
+  # it easy to ship configurations with your binary.
+  source = "https://example.com/my.zip"
+
+  options {
+    checksum = "md5:7f4b3e3b4dd5150d4e5aaaa5efada4c3"
+  }
+}
+```
+
 ## JSON Syntax
 
 Job files can also be specified in JSON. The conversion is straightforward
 and self-documented. The downsides of JSON are less human readability and
 the lack of comments. Otherwise, the two are completely interoperable.
 
-See the API documentation for more details on the JSON structure.
+See the [JSON API documentation](/docs/jobspec/json.html) for more details on
+the JSON structure.
 
 

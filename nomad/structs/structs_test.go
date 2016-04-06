@@ -131,6 +131,11 @@ func testJob() *Job {
 						Env: map[string]string{
 							"FOO": "bar",
 						},
+						Artifacts: []*TaskArtifact{
+							{
+								GetterSource: "http://foo.com",
+							},
+						},
 						Services: []*Service{
 							{
 								Name:      "${TASK}-frontend",
@@ -191,6 +196,7 @@ func TestJob_IsPeriodic(t *testing.T) {
 
 func TestTaskGroup_Validate(t *testing.T) {
 	tg := &TaskGroup{
+		Count: -1,
 		RestartPolicy: &RestartPolicy{
 			Interval: 5 * time.Minute,
 			Delay:    10 * time.Second,
@@ -203,7 +209,7 @@ func TestTaskGroup_Validate(t *testing.T) {
 	if !strings.Contains(mErr.Errors[0].Error(), "group name") {
 		t.Fatalf("err: %s", err)
 	}
-	if !strings.Contains(mErr.Errors[1].Error(), "count must be positive") {
+	if !strings.Contains(mErr.Errors[1].Error(), "count can't be negative") {
 		t.Fatalf("err: %s", err)
 	}
 	if !strings.Contains(mErr.Errors[2].Error(), "Missing tasks") {
@@ -519,7 +525,7 @@ func TestInvalidServiceCheck(t *testing.T) {
 		},
 	}
 	if err := s.Validate(); err == nil {
-		t.Fatalf("Service should be invalid")
+		t.Fatalf("Service should be invalid (invalid type)")
 	}
 
 	s = Service{
@@ -527,7 +533,23 @@ func TestInvalidServiceCheck(t *testing.T) {
 		PortLabel: "bar",
 	}
 	if err := s.Validate(); err == nil {
-		t.Fatalf("Service should be invalid: %v", err)
+		t.Fatalf("Service should be invalid (contains a dot): %v", err)
+	}
+
+	s = Service{
+		Name:      "-my-service",
+		PortLabel: "bar",
+	}
+	if err := s.Validate(); err == nil {
+		t.Fatalf("Service should be invalid (begins with a hyphen): %v", err)
+	}
+
+	s = Service{
+		Name:      "abcdef0123456789-abcdef0123456789-abcdef0123456789-abcdef0123456",
+		PortLabel: "bar",
+	}
+	if err := s.Validate(); err == nil {
+		t.Fatalf("Service should be invalid (too long): %v", err)
 	}
 }
 
@@ -745,5 +767,77 @@ func TestAllocation_Index(t *testing.T) {
 
 	if a1.Index() != e1 || a2.Index() != e2 {
 		t.Fatal()
+	}
+}
+
+func TestTaskArtifact_Validate_Source(t *testing.T) {
+	valid := &TaskArtifact{GetterSource: "google.com"}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestTaskArtifact_Validate_Dest(t *testing.T) {
+	valid := &TaskArtifact{GetterSource: "google.com"}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	valid.RelativeDest = "local/"
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	valid.RelativeDest = "local/.."
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	valid.RelativeDest = "local/../.."
+	if err := valid.Validate(); err == nil {
+		t.Fatalf("expected error: %v", err)
+	}
+}
+
+func TestTaskArtifact_Validate_Checksum(t *testing.T) {
+	cases := []struct {
+		Input *TaskArtifact
+		Err   bool
+	}{
+		{
+			&TaskArtifact{
+				GetterSource: "foo.com",
+				GetterOptions: map[string]string{
+					"checksum": "no-type",
+				},
+			},
+			true,
+		},
+		{
+			&TaskArtifact{
+				GetterSource: "foo.com",
+				GetterOptions: map[string]string{
+					"checksum": "md5:toosmall",
+				},
+			},
+			true,
+		},
+		{
+			&TaskArtifact{
+				GetterSource: "foo.com",
+				GetterOptions: map[string]string{
+					"checksum": "invalid:type",
+				},
+			},
+			true,
+		},
+	}
+
+	for i, tc := range cases {
+		err := tc.Input.Validate()
+		if (err != nil) != tc.Err {
+			t.Fatalf("case %d: %v", i, err)
+			continue
+		}
 	}
 }

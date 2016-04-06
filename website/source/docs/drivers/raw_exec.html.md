@@ -18,17 +18,10 @@ As such, it should be used with extreme care and is disabled by default.
 
 The `raw_exec` driver supports the following configuration in the job spec:
 
-* `command` - The command to execute. Must be provided.
-
-* `artifact_source` – (Optional) Source location of an executable artifact. Must
-  be accessible from the Nomad client. If you specify an `artifact_source` to be
-  executed, you must reference it in the `command` as show in the examples below
-
-* `checksum` - (Optional) The checksum type and value for the `artifact_source`
-  image.  The format is `type:value`, where type is any of `md5`, `sha1`,
-  `sha256`, or `sha512`, and the value is the computed checksum. If a checksum
-  is supplied and does not match the downloaded artifact, the driver will fail
-  to start
+* `command` - The command to execute. Must be provided. If executing a binary
+  that exists on the host, the path must be absolute. If executing a binary that
+  is download from an [`artifact`](/docs/jobspec/index.html#artifact_doc), the
+  path can be relative from the allocations's root directory.
 
 *   `args` - (Optional) A list of arguments to the optional `command`.
     References to environment variables or any [intepretable Nomad
@@ -39,44 +32,54 @@ The `raw_exec` driver supports the following configuration in the job spec:
         args = ["${nomad.datacenter}", "${MY_ENV}", "${meta.foo}"]
     ```
 
-## Client Requirements
-
-The `raw_exec` driver can run on all supported operating systems. It is however
-disabled by default. In order to be enabled, the Nomad client configuration must
-explicitly enable the `raw_exec` driver in the client's
-[options](../agent/config.html#options) field:
-
-```
-  client {
-    options = {
-        "driver.raw_exec.enable" = "1"
-    }
-  }
-```
-
-You must specify a `command` to be executed. Optionally you can specify an
-`artifact_source` to be executed. Any `command` is assumed to be present on the 
-running client, or a downloaded artifact
-
 ## Examples
 
 To run a binary present on the Node:
 
 ```
-  config {
-    command = "/bin/sleep"
-    args = 1
+  task "example" {
+    driver = "raw_exec"
+
+    config {
+      # When running a binary that exists on the host, the path must be absolute
+      command = "/bin/sleep"
+      args = ["1"]
+    }
   }
 ```
 
-To execute a binary specified by `artifact_source`:
+To execute a binary downloaded from an [`artifact`](/docs/jobspec/index.html#artifact_doc):
 
 ```
-  config {
-    artifact_source = "https://dl.dropboxusercontent.com/u/1234/binary.bin"
-    checksum = "sha256:133jifjiofu9090fsadjofsdjlk"
-    command = "binary.bin"
+  task "example" {
+    driver = "raw_exec"
+
+    config {
+      command = "binary.bin"
+    }
+
+    artifact {
+      source = "https://dl.dropboxusercontent.com/u/1234/binary.bin"
+      options {
+        checksum = "sha256:abd123445ds4555555555"
+      }
+    }
   }
+```
+
+## Client Requirements
+
+The `raw_exec` driver can run on all supported operating systems. It is however
+disabled by default. In order to be enabled, the Nomad client configuration must
+explicitly enable the `raw_exec` driver in the client's
+[options](/docs/agent/config.html#options) field:
+
+```
+    client {
+        options = {
+            "driver.raw_exec.enable" = "1"
+        }
+    }
 ```
 
 ## Client Attributes

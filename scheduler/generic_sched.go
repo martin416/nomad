@@ -231,15 +231,8 @@ func (s *GenericScheduler) process() (bool, error) {
 // re-placed.
 func (s *GenericScheduler) filterCompleteAllocs(allocs []*structs.Allocation) []*structs.Allocation {
 	filter := func(a *structs.Allocation) bool {
-		// Allocs from batch jobs should be filtered when their status is failed so that
-		// they will be replaced. If they are dead but not failed, they
-		// shouldn't be replaced.
-		if s.batch {
-			return a.ClientStatus == structs.AllocClientStatusFailed
-		}
-
-		// Filter terminal, non batch allocations
-		return a.TerminalStatus()
+		// TODO: Limit the number of times we restart a failed allocation.
+		return a.TerminalStatus() || a.ClientStatus == structs.AllocClientStatusFailed
 	}
 
 	n := len(allocs)
@@ -353,6 +346,7 @@ func (s *GenericScheduler) computePlacements(place []allocTuple) error {
 		// Set fields based on if we found an allocation option
 		if option != nil {
 			// Generate service IDs tasks in this allocation
+			// COMPAT - This is no longer required and would be removed in v0.4
 			alloc.PopulateServiceIDs(missing.TaskGroup)
 
 			alloc.NodeID = option.Node.ID

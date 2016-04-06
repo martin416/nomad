@@ -2,9 +2,10 @@ package command
 
 import (
 	"fmt"
-	"github.com/hashicorp/nomad/api"
 	"sort"
 	"strings"
+
+	"github.com/hashicorp/nomad/api"
 )
 
 type NodeStatusCommand struct {
@@ -21,7 +22,8 @@ Usage: nomad node-status [options] <node>
 
   If a node ID is passed, information for that specific node will
   be displayed. If no node ID's are passed, then a short-hand
-  list of all nodes will be displayed.
+  list of all nodes will be displayed. The -self flag is useful to
+  quickly access the status of the local node.
 
 General Options:
 
@@ -36,6 +38,9 @@ Node Status Options:
   -verbose
     Display full information.
 
+  -self
+    Query the status of the local node.
+
   -allocs
     Display a count of running allocations for each node.
 `
@@ -47,13 +52,14 @@ func (c *NodeStatusCommand) Synopsis() string {
 }
 
 func (c *NodeStatusCommand) Run(args []string) int {
-	var short, verbose, list_allocs bool
+	var short, verbose, list_allocs, self bool
 
 	flags := c.Meta.FlagSet("node-status", FlagSetClient)
 	flags.Usage = func() { c.Ui.Output(c.Help()) }
 	flags.BoolVar(&short, "short", false, "")
 	flags.BoolVar(&verbose, "verbose", false, "")
 	flags.BoolVar(&list_allocs, "allocs", false, "")
+	flags.BoolVar(&self, "self", false, "")
 
 	if err := flags.Parse(args); err != nil {
 		return 1
@@ -79,8 +85,32 @@ func (c *NodeStatusCommand) Run(args []string) int {
 		return 1
 	}
 
+	// If -self flag is set then determine the current node.
+	nodeID := ""
+	if self {
+		info, err := client.Agent().Self()
+		if err != nil {
+			c.Ui.Error(fmt.Sprintf("Error querying agent info: %s", err))
+			return 1
+		}
+		var stats map[string]interface{}
+		stats, _ = info["stats"]
+		clientStats, ok := stats["client"].(map[string]interface{})
+		if !ok {
+			c.Ui.Error("Nomad not running in client mode")
+			return 1
+		}
+
+		nodeID, ok = clientStats["node_id"].(string)
+		if !ok {
+			c.Ui.Error("Failed to determine node ID")
+			return 1
+		}
+
+	}
+
 	// Use list mode if no node name was provided
-	if len(args) == 0 {
+	if len(args) == 0 && !self {
 		// Query the node info
 		nodes, _, err := client.Nodes().List(nil)
 		if err != nil {
@@ -132,68 +162,53 @@ func (c *NodeStatusCommand) Run(args []string) int {
 	}
 
 	// Query the specific node
-	nodeID := args[0]
-	node, _, err := client.Nodes().Info(nodeID, nil)
+	if !self {
+		nodeID = args[0]
+	}
+	if len(nodeID) == 1 {
+		c.Ui.Error(fmt.Sprintf("Identifier must contain at least two characters."))
+		return 1
+	}
+	if len(nodeID)%2 == 1 {
+		// Identifiers must be of even length, so we strip off the last byte
+		// to provide a consistent user experience.
+		nodeID = nodeID[:len(nodeID)-1]
+	}
+
+	// Exact lookup failed, try with prefix based search
+	nodes, _, err := client.Nodes().PrefixList(nodeID)
 	if err != nil {
-		if len(nodeID) == 1 {
-			c.Ui.Error(fmt.Sprintf("Identifier must contain at least two characters."))
-			return 1
-		}
-		if len(nodeID)%2 == 1 {
-			// Identifiers must be of even length, so we strip off the last byte
-			// to provide a consistent user experience.
-			nodeID = nodeID[:len(nodeID)-1]
-		}
-
-		// Exact lookup failed, try with prefix based search
-		nodes, _, err := client.Nodes().PrefixList(nodeID)
-		if err != nil {
-			c.Ui.Error(fmt.Sprintf("Error querying node info: %s", err))
-			return 1
-		}
-		// Return error if no nodes are found
-		if len(nodes) == 0 {
-			c.Ui.Error(fmt.Sprintf("No node(s) with prefix %q found", nodeID))
-			return 1
-		}
-		if len(nodes) > 1 {
-			// Format the nodes list that matches the prefix so that the user
-			// can create a more specific request
-			out := make([]string, len(nodes)+1)
-			out[0] = "ID|DC|Name|Class|Drain|Status"
-			for i, node := range nodes {
-				out[i+1] = fmt.Sprintf("%s|%s|%s|%s|%v|%s",
-					limit(node.ID, length),
-					node.Datacenter,
-					node.Name,
-					node.NodeClass,
-					node.Drain,
-					node.Status)
-			}
-			// Dump the output
-			c.Ui.Output(fmt.Sprintf("Prefix matched multiple nodes\n\n%s", formatList(out)))
-			return 0
-		}
-		// Prefix lookup matched a single node
-		node, _, err = client.Nodes().Info(nodes[0].ID, nil)
-		if err != nil {
-			c.Ui.Error(fmt.Sprintf("Error querying node info: %s", err))
-			return 1
-		}
+		c.Ui.Error(fmt.Sprintf("Error querying node info: %s", err))
+		return 1
 	}
-
-	m := node.Attributes
-	keys := make([]string, len(m))
-	for k := range m {
-		keys = append(keys, k)
+	// Return error if no nodes are found
+	if len(nodes) == 0 {
+		c.Ui.Error(fmt.Sprintf("No node(s) with prefix %q found", nodeID))
+		return 1
 	}
-	sort.Strings(keys)
-
-	var attributes []string
-	for _, k := range keys {
-		if k != "" {
-			attributes = append(attributes, fmt.Sprintf("%s:%s", k, m[k]))
+	if len(nodes) > 1 {
+		// Format the nodes list that matches the prefix so that the user
+		// can create a more specific request
+		out := make([]string, len(nodes)+1)
+		out[0] = "ID|DC|Name|Class|Drain|Status"
+		for i, node := range nodes {
+			out[i+1] = fmt.Sprintf("%s|%s|%s|%s|%v|%s",
+				limit(node.ID, length),
+				node.Datacenter,
+				node.Name,
+				node.NodeClass,
+				node.Drain,
+				node.Status)
 		}
+		// Dump the output
+		c.Ui.Output(fmt.Sprintf("Prefix matched multiple nodes\n\n%s", formatList(out)))
+		return 0
+	}
+	// Prefix lookup matched a single node
+	node, _, err := client.Nodes().Info(nodes[0].ID, nil)
+	if err != nil {
+		c.Ui.Error(fmt.Sprintf("Error querying node info: %s", err))
+		return 1
 	}
 
 	// Format the output
@@ -204,19 +219,10 @@ func (c *NodeStatusCommand) Run(args []string) int {
 		fmt.Sprintf("DC|%s", node.Datacenter),
 		fmt.Sprintf("Drain|%v", node.Drain),
 		fmt.Sprintf("Status|%s", node.Status),
-		fmt.Sprintf("Attributes|%s", strings.Join(attributes, ", ")),
 	}
-
-	// Dump the output
 	c.Ui.Output(formatKV(basic))
+
 	if !short {
-		allocs, err := getAllocs(client, node, length)
-		if err != nil {
-			c.Ui.Error(fmt.Sprintf("Error querying node allocations: %s", err))
-			return 1
-		}
-		c.Ui.Output("\n==> Allocations")
-		c.Ui.Output(formatList(allocs))
 		resources, err := getResources(client, node)
 		if err != nil {
 			c.Ui.Error(fmt.Sprintf("Error querying node resources: %s", err))
@@ -224,7 +230,37 @@ func (c *NodeStatusCommand) Run(args []string) int {
 		}
 		c.Ui.Output("\n==> Resource Utilization")
 		c.Ui.Output(formatList(resources))
+
+		allocs, err := getAllocs(client, node, length)
+		if err != nil {
+			c.Ui.Error(fmt.Sprintf("Error querying node allocations: %s", err))
+			return 1
+		}
+
+		if len(allocs) > 1 {
+			c.Ui.Output("\n==> Allocations")
+			c.Ui.Output(formatList(allocs))
+		}
 	}
+
+	if verbose {
+		// Print the attributes
+		keys := make([]string, len(node.Attributes))
+		for k := range node.Attributes {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+
+		var attributes []string
+		for _, k := range keys {
+			if k != "" {
+				attributes = append(attributes, fmt.Sprintf("%s|%s", k, node.Attributes[k]))
+			}
+		}
+		c.Ui.Output("\n==> Attributes")
+		c.Ui.Output(formatKV(attributes))
+	}
+
 	return 0
 }
 
@@ -263,9 +299,22 @@ func getAllocs(client *api.Client, node *api.Node, length int) ([]string, error)
 	return allocs, err
 }
 
+// getResources returns the resource usage of the node.
 func getResources(client *api.Client, node *api.Node) ([]string, error) {
 	var resources []string
 	var cpu, mem, disk, iops int
+	var totalCpu, totalMem, totalDisk, totalIops int
+
+	// Compute the total
+	r := node.Resources
+	res := node.Reserved
+	if res == nil {
+		res = &api.Resources{}
+	}
+	totalCpu = r.CPU - res.CPU
+	totalMem = r.MemoryMB - res.MemoryMB
+	totalDisk = r.DiskMB - res.DiskMB
+	totalIops = r.IOPS - res.IOPS
 
 	// Get list of running allocations on the node
 	runningAllocs, err := getRunningAllocs(client, node.ID)
@@ -280,11 +329,15 @@ func getResources(client *api.Client, node *api.Node) ([]string, error) {
 
 	resources = make([]string, 2)
 	resources[0] = "CPU|Memory MB|Disk MB|IOPS"
-	resources[1] = fmt.Sprintf("%v|%v|%v|%v",
+	resources[1] = fmt.Sprintf("%v/%v|%v/%v|%v/%v|%v/%v",
 		cpu,
+		totalCpu,
 		mem,
+		totalMem,
 		disk,
-		iops)
+		totalDisk,
+		iops,
+		totalIops)
 
 	return resources, err
 }

@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"io"
 	"log"
 	"math/rand"
 	"os"
@@ -36,6 +37,31 @@ func TestMain(m *testing.M) {
 	if !testtask.Run() {
 		os.Exit(m.Run())
 	}
+}
+
+// copyFile moves an existing file to the destination
+func copyFile(src, dst string, t *testing.T) {
+	in, err := os.Open(src)
+	if err != nil {
+		t.Fatalf("copying %v -> %v failed: %v", src, dst, err)
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		t.Fatalf("copying %v -> %v failed: %v", src, dst, err)
+	}
+	defer func() {
+		if err := out.Close(); err != nil {
+			t.Fatalf("copying %v -> %v failed: %v", src, dst, err)
+		}
+	}()
+	if _, err = io.Copy(out, in); err != nil {
+		t.Fatalf("copying %v -> %v failed: %v", src, dst, err)
+	}
+	if err := out.Sync(); err != nil {
+		t.Fatalf("copying %v -> %v failed: %v", src, dst, err)
+	}
+	return
 }
 
 func testLogger() *log.Logger {
@@ -98,21 +124,25 @@ func TestDriver_GetTaskEnv(t *testing.T) {
 		t.Fatalf("GetTaskEnv() failed: %v", err)
 	}
 	exp := map[string]string{
-		"NOMAD_CPU_LIMIT":       "1000",
-		"NOMAD_MEMORY_LIMIT":    "500",
-		"NOMAD_ADDR_one":        "1.2.3.4:80",
-		"NOMAD_ADDR_two":        "1.2.3.4:443",
-		"NOMAD_ADDR_three":      "1.2.3.4:8080",
-		"NOMAD_ADDR_four":       "1.2.3.4:12345",
-		"NOMAD_ADDR_admin":      "1.2.3.4:8081",
-		"NOMAD_ADDR_web":        "1.2.3.4:8086",
-		"NOMAD_META_CHOCOLATE":  "cake",
-		"NOMAD_META_STRAWBERRY": "icecream",
-		"HELLO":                 "world",
-		"lorem":                 "ipsum",
-		"NOMAD_ALLOC_ID":        alloc.ID,
-		"NOMAD_ALLOC_NAME":      alloc.Name,
-		"NOMAD_TASK_NAME":       task.Name,
+		"NOMAD_CPU_LIMIT":               "1000",
+		"NOMAD_MEMORY_LIMIT":            "500",
+		"NOMAD_ADDR_one":                "1.2.3.4:80",
+		"NOMAD_ADDR_two":                "1.2.3.4:443",
+		"NOMAD_ADDR_three":              "1.2.3.4:8080",
+		"NOMAD_ADDR_four":               "1.2.3.4:12345",
+		"NOMAD_ADDR_admin":              "1.2.3.4:8081",
+		"NOMAD_ADDR_web":                "1.2.3.4:8086",
+		"NOMAD_META_CHOCOLATE":          "cake",
+		"NOMAD_META_STRAWBERRY":         "icecream",
+		"NOMAD_META_ELB_CHECK_INTERVAL": "30s",
+		"NOMAD_META_ELB_CHECK_TYPE":     "http",
+		"NOMAD_META_ELB_CHECK_MIN":      "3",
+		"NOMAD_META_OWNER":              "armon",
+		"HELLO":                         "world",
+		"lorem":                         "ipsum",
+		"NOMAD_ALLOC_ID":                alloc.ID,
+		"NOMAD_ALLOC_NAME":              alloc.Name,
+		"NOMAD_TASK_NAME":               task.Name,
 	}
 
 	act := env.EnvMap()

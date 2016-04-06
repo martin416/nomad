@@ -3,10 +3,9 @@ package driver
 import (
 	"fmt"
 	"io/ioutil"
-	"net/http"
-	"net/http/httptest"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -97,57 +96,6 @@ func TestRawExecDriver_StartOpen_Wait(t *testing.T) {
 	}
 	handle.Kill()
 	handle2.Kill()
-}
-
-func TestRawExecDriver_Start_Artifact_basic(t *testing.T) {
-	t.Parallel()
-	path := testtask.Path()
-	ts := httptest.NewServer(http.FileServer(http.Dir(filepath.Dir(path))))
-	defer ts.Close()
-
-	file := filepath.Base(path)
-	task := &structs.Task{
-		Name: "sleep",
-		Config: map[string]interface{}{
-			"artifact_source": fmt.Sprintf("%s/%s", ts.URL, file),
-			"command":         file,
-			"args":            []string{"sleep", "1s"},
-		},
-		LogConfig: &structs.LogConfig{
-			MaxFiles:      10,
-			MaxFileSizeMB: 10,
-		},
-		Resources: basicResources,
-	}
-	testtask.SetTaskEnv(task)
-
-	driverCtx, execCtx := testDriverContexts(task)
-	defer execCtx.AllocDir.Destroy()
-	d := NewRawExecDriver(driverCtx)
-
-	handle, err := d.Start(execCtx, task)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if handle == nil {
-		t.Fatalf("missing handle")
-	}
-
-	// Attempt to open
-	handle2, err := d.Open(execCtx, handle.ID())
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if handle2 == nil {
-		t.Fatalf("missing handle")
-	}
-
-	// Task should terminate quickly
-	select {
-	case <-handle2.WaitCh():
-	case <-time.After(time.Duration(testutil.TestMultiplier()*5) * time.Second):
-		t.Fatalf("timeout")
-	}
 }
 
 func TestRawExecDriver_Start_Wait(t *testing.T) {
@@ -296,5 +244,37 @@ func TestRawExecDriver_Start_Kill_Wait(t *testing.T) {
 		}
 	case <-time.After(time.Duration(testutil.TestMultiplier()*5) * time.Second):
 		t.Fatalf("timeout")
+	}
+}
+
+func TestRawExecDriverUser(t *testing.T) {
+	t.Parallel()
+	task := &structs.Task{
+		Name: "sleep",
+		User: "alice",
+		Config: map[string]interface{}{
+			"command": testtask.Path(),
+			"args":    []string{"sleep", "45s"},
+		},
+		LogConfig: &structs.LogConfig{
+			MaxFiles:      10,
+			MaxFileSizeMB: 10,
+		},
+		Resources: basicResources,
+	}
+	testtask.SetTaskEnv(task)
+
+	driverCtx, execCtx := testDriverContexts(task)
+	defer execCtx.AllocDir.Destroy()
+	d := NewRawExecDriver(driverCtx)
+
+	handle, err := d.Start(execCtx, task)
+	if err == nil {
+		handle.Kill()
+		t.Fatalf("Should've failed")
+	}
+	msg := "unknown user alice"
+	if !strings.Contains(err.Error(), msg) {
+		t.Fatalf("Expecting '%v' in '%v'", msg, err)
 	}
 }

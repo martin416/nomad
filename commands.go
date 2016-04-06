@@ -18,6 +18,7 @@ func Commands(metaPtr *command.Meta) map[string]cli.CommandFactory {
 	meta := *metaPtr
 	if meta.Ui == nil {
 		meta.Ui = &cli.BasicUi{
+			Reader:      os.Stdin,
 			Writer:      os.Stdout,
 			ErrorWriter: os.Stderr,
 		}
@@ -87,7 +88,11 @@ func Commands(metaPtr *command.Meta) map[string]cli.CommandFactory {
 				Meta: meta,
 			}, nil
 		},
-
+		"inspect": func() (cli.Command, error) {
+			return &command.InspectCommand{
+				Meta: meta,
+			}, nil
+		},
 		"node-drain": func() (cli.Command, error) {
 			return &command.NodeDrainCommand{
 				Meta: meta,

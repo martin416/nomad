@@ -111,7 +111,7 @@ func (d *AllocDir) Build(tasks []*structs.Task) error {
 	}
 
 	// Make the shared directory and make it availabe to all user/groups.
-	if err := os.Mkdir(d.SharedDir, 0777); err != nil {
+	if err := os.MkdirAll(d.SharedDir, 0777); err != nil {
 		return err
 	}
 
@@ -122,7 +122,7 @@ func (d *AllocDir) Build(tasks []*structs.Task) error {
 
 	for _, dir := range SharedAllocDirs {
 		p := filepath.Join(d.SharedDir, dir)
-		if err := os.Mkdir(p, 0777); err != nil {
+		if err := os.MkdirAll(p, 0777); err != nil {
 			return err
 		}
 		if err := d.dropDirPermissions(p); err != nil {
@@ -133,7 +133,7 @@ func (d *AllocDir) Build(tasks []*structs.Task) error {
 	// Make the task directories.
 	for _, t := range tasks {
 		taskDir := filepath.Join(d.AllocDir, t.Name)
-		if err := os.Mkdir(taskDir, 0777); err != nil {
+		if err := os.MkdirAll(taskDir, 0777); err != nil {
 			return err
 		}
 
@@ -144,7 +144,7 @@ func (d *AllocDir) Build(tasks []*structs.Task) error {
 
 		// Create a local directory that each task can use.
 		local := filepath.Join(taskDir, TaskLocal)
-		if err := os.Mkdir(local, 0777); err != nil {
+		if err := os.MkdirAll(local, 0777); err != nil {
 			return err
 		}
 
@@ -157,7 +157,7 @@ func (d *AllocDir) Build(tasks []*structs.Task) error {
 		// Create the directories that should be in every task.
 		for _, dir := range TaskDirs {
 			local := filepath.Join(taskDir, dir)
-			if err := os.Mkdir(local, 0777); err != nil {
+			if err := os.MkdirAll(local, 0777); err != nil {
 				return err
 			}
 
@@ -330,6 +330,9 @@ func (d *AllocDir) ReadAt(path string, offset int64, limit int64) (io.ReadCloser
 	f, err := os.Open(p)
 	if err != nil {
 		return nil, err
+	}
+	if _, err := f.Seek(offset, 0); err != nil {
+		return nil, fmt.Errorf("can't seek to offset %q: %v", offset, err)
 	}
 	return &ReadCloserWrapper{Reader: io.LimitReader(f, limit), Closer: f}, nil
 }

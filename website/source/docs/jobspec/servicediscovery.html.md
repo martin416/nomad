@@ -37,6 +37,20 @@ Nomad does not currently run Consul for you.
 * `consul.verifyssl`: This option enables SSL verification when the transport
  scheme for the Consul API client is `https`. This is set to true by default.
 
+* `consul.tls_ca_file`: The path to the CA certificate used for Consul communication.
+  Set accordingly to the
+  [ca_file](https://www.consul.io/docs/agent/options.html#ca_file) setting in
+  Consul.
+
+* `consul.tls_cert_file`: The path to the certificate for Consul communication. Set
+  accordingly
+  [cert_file](https://www.consul.io/docs/agent/options.html#cert_file) in
+  Consul.
+
+* `consul.tls_key_file`: The path to the private key for Consul communication.
+  Set accordingly to the
+  [key_file](https://www.consul.io/docs/agent/options.html#key_file) setting in
+  Consul.
 
 ## Service Definition Syntax
 
@@ -61,6 +75,14 @@ group "database" {
                 interval = "10s"
                 timeout = "2s"
             }
+            check {
+                type = "script"
+                name = "check_table"
+                cmd = "/usr/local/bin/check_mysql_table_status"
+                args = ["--verbose"]
+                interval = "60s"
+                timeout = "5s"
+            }
         }
         resources {
             cpu = 500
@@ -76,15 +98,20 @@ group "database" {
 ```
 
 * `name`: Nomad automatically determines the name of a Task. By default the
-  name of a service is $(job-name)-$(task-group)-$(task-name). Users can
+  name of a service is `$(job-name)-$(task-group)-$(task-name)`. Users can
   explicitly name the service by specifying this option. If multiple services
-  are defined for a Task then only one task can have the default name, all the
-  services have to be explicitly named. Users can add the following to the
-  service names: ```${JOB}```, ```${TASKGROUP}```, ```${TASK}```, ```${BASE}```. 
-  Nomad will replace them with the appropriate value of the Job, Task Group and 
-  Task names while registering the Job. ```${BASE}``` expands to ${JOB}-${TASKGROUP}-${TASK}
+  are defined for a Task then only one task can have the default name, all
+  the services have to be explicitly named.  Users can add the following to
+  the service names: `${JOB}`, `${TASKGROUP}`, `${TASK}`, `${BASE}`.  Nomad
+  will replace them with the appropriate value of the Job, Task Group, and
+  Task names while registering the Job. `${BASE}` expands to
+  `${JOB}-${TASKGROUP}-${TASK}`.  Names must be adhere to
+  [RFC-1123 §2.1](https://tools.ietf.org/html/rfc1123#section-2) and are
+  limited to alphanumeric and hyphen characters (i.e. `[a-z0-9\-]`), and be
+  less than 64 characters in length.
 
-* `tags`: A list of tags associated with this Service.
+* `tags`: A list of tags associated with this Service. String interpolation is
+  supported in tags.
 
 * `port`: The port indicates the port associated with the service. Users are
   required to specify a valid port label here which they have defined in the
@@ -93,8 +120,10 @@ group "database" {
   with Consul.
 
 * `check`: A check block defines a health check associated with the service.
-  Multiple check blocks are allowed for a service. Nomad currently supports
-  only the `http` and `tcp` Consul Checks.
+  Multiple check blocks are allowed for a service. Nomad supports the `script`,
+  `http` and `tcp` Consul Checks. Script checks are not supported for the qemu
+  driver since the Nomad client doesn't have access to the file system of a
+  tasks using the Qemu driver.
 
 ### Check Syntax
 
@@ -116,7 +145,14 @@ group "database" {
 * `protocol`: This indicates the protocol for the http checks. Valid options
   are `http` and `https`. We default it to `http`
 
+* `command`: This is the command that the Nomad client runs for doing script based
+  health check.
+
+* `args`: Additional arguments to the `command` for script based health checks.
+
 ## Assumptions
+
+* Consul 0.6.4 or later is needed for using the Script checks.
 
 * Consul 0.6.0 or later is needed for using the TCP checks.
 

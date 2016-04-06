@@ -88,6 +88,7 @@ func TestParse(t *testing.T) {
 							&structs.Task{
 								Name:   "binstore",
 								Driver: "docker",
+								User:   "bob",
 								Config: map[string]interface{}{
 									"image": "hashicorp/binstore",
 								},
@@ -128,10 +129,27 @@ func TestParse(t *testing.T) {
 									MaxFiles:      10,
 									MaxFileSizeMB: 100,
 								},
+								Artifacts: []*structs.TaskArtifact{
+									{
+										GetterSource: "http://foo.com/artifact",
+										RelativeDest: "local/",
+										GetterOptions: map[string]string{
+											"checksum": "md5:b8a4f3f72ecab0510a6a31e997461c5f",
+										},
+									},
+									{
+										GetterSource: "http://bar.com/artifact",
+										RelativeDest: "local/",
+										GetterOptions: map[string]string{
+											"checksum": "md5:ff1cc0d3432dad54d607c1505fb7245c",
+										},
+									},
+								},
 							},
 							&structs.Task{
 								Name:   "storagelocker",
 								Driver: "java",
+								User:   "",
 								Config: map[string]interface{}{
 									"image": "hashicorp/storagelocker",
 								},
@@ -301,6 +319,63 @@ func TestParse(t *testing.T) {
 			},
 			false,
 		},
+		{
+			"bad-artifact.hcl",
+			nil,
+			true,
+		},
+
+		{
+			"artifacts.hcl",
+			&structs.Job{
+				ID:       "binstore-storagelocker",
+				Name:     "binstore-storagelocker",
+				Type:     "service",
+				Priority: 50,
+				Region:   "global",
+
+				TaskGroups: []*structs.TaskGroup{
+					&structs.TaskGroup{
+						Name:  "binsl",
+						Count: 1,
+						Tasks: []*structs.Task{
+							&structs.Task{
+								Name:   "binstore",
+								Driver: "docker",
+								Resources: &structs.Resources{
+									CPU:      100,
+									MemoryMB: 10,
+									DiskMB:   300,
+									IOPS:     0,
+								},
+								LogConfig: &structs.LogConfig{
+									MaxFiles:      10,
+									MaxFileSizeMB: 10,
+								},
+								Artifacts: []*structs.TaskArtifact{
+									{
+										GetterSource:  "http://foo.com/bar",
+										GetterOptions: map[string]string{},
+										RelativeDest:  "",
+									},
+									{
+										GetterSource:  "http://foo.com/baz",
+										GetterOptions: map[string]string{},
+										RelativeDest:  "local/",
+									},
+									{
+										GetterSource:  "http://foo.com/bam",
+										GetterOptions: map[string]string{},
+										RelativeDest:  "var/foo",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			false,
+		},
 	}
 
 	for _, tc := range cases {
@@ -367,6 +442,23 @@ func TestIncompleteServiceDefn(t *testing.T) {
 	}
 
 	if !strings.Contains(err.Error(), "Only one service block may omit the Name field") {
+		t.Fatalf("Expected collision error; got %v", err)
+	}
+}
+
+func TestIncorrectKey(t *testing.T) {
+	path, err := filepath.Abs(filepath.Join("./test-fixtures", "basic_wrong_key.hcl"))
+	if err != nil {
+		t.Fatalf("Can't get absolute path for file: %s", err)
+	}
+
+	_, err = ParseFile(path)
+
+	if err == nil {
+		t.Fatalf("Expected an error")
+	}
+
+	if !strings.Contains(err.Error(), "* group: 'binsl', task: 'binstore', service: 'binstore-storagelocker-binsl-binstore', check -> invalid key: nterval") {
 		t.Fatalf("Expected collision error; got %v", err)
 	}
 }

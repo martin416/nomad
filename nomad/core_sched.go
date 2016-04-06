@@ -85,6 +85,8 @@ OUTER:
 		for _, eval := range evals {
 			gc, allocs, err := c.gcEval(eval, oldThreshold)
 			if err != nil || !gc {
+				// We skip the job because it is not finished if it has
+				// non-terminal allocations.
 				continue OUTER
 			}
 
@@ -155,9 +157,18 @@ func (c *CoreScheduler) evalGC(eval *structs.Evaluation) error {
 	var gcAlloc, gcEval []string
 	for raw := iter.Next(); raw != nil; raw = iter.Next() {
 		eval := raw.(*structs.Evaluation)
+
 		gc, allocs, err := c.gcEval(eval, oldThreshold)
 		if err != nil {
 			return err
+		}
+
+		// If the eval is from a "batch" job we don't want to garbage collect
+		// its allocations. If there is a long running batch job and its
+		// terminal allocations get GC'd the scheduler would re-run the
+		// allocations.
+		if len(allocs) != 0 && eval.Type == structs.JobTypeBatch {
+			continue
 		}
 
 		if gc {
@@ -198,7 +209,12 @@ func (c *CoreScheduler) gcEval(eval *structs.Evaluation, thresholdIndex uint64) 
 
 	// Scan the allocations to ensure they are terminal and old
 	for _, alloc := range allocs {
-		if !alloc.TerminalStatus() || alloc.ModifyIndex > thresholdIndex {
+		// TODO: This can go away once the scheduler marks an alloc as
+		// DesiredStatusStop when a client fails.
+		allocTerminal := alloc.TerminalStatus() ||
+			alloc.ClientStatus == structs.AllocClientStatusComplete ||
+			alloc.ClientStatus == structs.AllocClientStatusFailed
+		if !allocTerminal || alloc.ModifyIndex > thresholdIndex {
 			return false, nil, nil
 		}
 	}

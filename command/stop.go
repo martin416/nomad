@@ -31,6 +31,9 @@ Stop Options:
     to the screen, which can be used to call up a monitor later if
     needed using the eval-monitor command.
 
+  -yes
+    Automatic yes to prompts.
+
   -verbose
     Display full information.
 `
@@ -42,12 +45,13 @@ func (c *StopCommand) Synopsis() string {
 }
 
 func (c *StopCommand) Run(args []string) int {
-	var detach, verbose bool
+	var detach, verbose, autoYes bool
 
 	flags := c.Meta.FlagSet("stop", FlagSetClient)
 	flags.Usage = func() { c.Ui.Output(c.Help()) }
 	flags.BoolVar(&detach, "detach", false, "")
 	flags.BoolVar(&verbose, "verbose", false, "")
+	flags.BoolVar(&autoYes, "yes", false, "")
 
 	if err := flags.Parse(args); err != nil {
 		return 1
@@ -75,34 +79,54 @@ func (c *StopCommand) Run(args []string) int {
 	}
 
 	// Check if the job exists
-	job, _, err := client.Jobs().Info(jobID, nil)
+	jobs, _, err := client.Jobs().PrefixList(jobID)
 	if err != nil {
-		jobs, _, err := client.Jobs().PrefixList(jobID)
+		c.Ui.Error(fmt.Sprintf("Error deregistering job: %s", err))
+		return 1
+	}
+	if len(jobs) == 0 {
+		c.Ui.Error(fmt.Sprintf("No job(s) with prefix or id %q found", jobID))
+		return 1
+	}
+	if len(jobs) > 1 {
+		out := make([]string, len(jobs)+1)
+		out[0] = "ID|Type|Priority|Status"
+		for i, job := range jobs {
+			out[i+1] = fmt.Sprintf("%s|%s|%d|%s",
+				job.ID,
+				job.Type,
+				job.Priority,
+				job.Status)
+		}
+		c.Ui.Output(fmt.Sprintf("Prefix matched multiple jobs\n\n%s", formatList(out)))
+		return 0
+	}
+	// Prefix lookup matched a single job
+	job, _, err := client.Jobs().Info(jobs[0].ID, nil)
+	if err != nil {
+		c.Ui.Error(fmt.Sprintf("Error deregistering job: %s", err))
+		return 1
+	}
+
+	// Confirm the stop if the job was a prefix match.
+	if jobID != job.ID && !autoYes {
+		question := fmt.Sprintf("Are you sure you want to stop job %q? [y/N]", job.ID)
+		answer, err := c.Ui.Ask(question)
 		if err != nil {
-			c.Ui.Error(fmt.Sprintf("Error deregistering job: %s", err))
+			c.Ui.Error(fmt.Sprintf("Failed to parse answer: %v", err))
 			return 1
 		}
-		if len(jobs) == 0 {
-			c.Ui.Error(fmt.Sprintf("No job(s) with prefix or id %q found", jobID))
-			return 1
-		}
-		if len(jobs) > 1 {
-			out := make([]string, len(jobs)+1)
-			out[0] = "ID|Type|Priority|Status"
-			for i, job := range jobs {
-				out[i+1] = fmt.Sprintf("%s|%s|%d|%s",
-					job.ID,
-					job.Type,
-					job.Priority,
-					job.Status)
-			}
-			c.Ui.Output(fmt.Sprintf("Prefix matched multiple jobs\n\n%s", formatList(out)))
+
+		if answer == "" || strings.ToLower(answer)[0] == 'n' {
+			// No case
+			c.Ui.Output("Cancelling job stop")
 			return 0
-		}
-		// Prefix lookup matched a single job
-		job, _, err = client.Jobs().Info(jobs[0].ID, nil)
-		if err != nil {
-			c.Ui.Error(fmt.Sprintf("Error deregistering job: %s", err))
+		} else if strings.ToLower(answer)[0] == 'y' && len(answer) > 1 {
+			// Non exact match yes
+			c.Ui.Output("For confirmation, an exact ‘y’ is required.")
+			return 0
+		} else if answer != "y" {
+			c.Ui.Output("No confirmation detected. For confirmation, an exact 'y' is required.")
 			return 1
 		}
 	}

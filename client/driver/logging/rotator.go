@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -35,6 +36,9 @@ type FileRotator struct {
 	logger      *log.Logger
 	purgeCh     chan struct{}
 	doneCh      chan struct{}
+
+	closed     bool
+	closedLock sync.Mutex
 }
 
 // NewFileRotator returns a new file rotator
@@ -194,6 +198,9 @@ func (f *FileRotator) flushPeriodically() {
 }
 
 func (f *FileRotator) Close() {
+	f.closedLock.Lock()
+	defer f.closedLock.Unlock()
+
 	// Stop the ticker and flush for one last time
 	f.flushTicker.Stop()
 	if f.bufw != nil {
@@ -201,8 +208,11 @@ func (f *FileRotator) Close() {
 	}
 
 	// Stop the purge go routine
-	f.doneCh <- struct{}{}
-	close(f.purgeCh)
+	if !f.closed {
+		f.doneCh <- struct{}{}
+		close(f.purgeCh)
+		f.closed = true
+	}
 }
 
 // purgeOldFiles removes older files and keeps only the last N files rotated for
@@ -228,11 +238,16 @@ func (f *FileRotator) purgeOldFiles() {
 				}
 			}
 
+			// Not continuing to delete files if the number of files is not more
+			// than MaxFiles
+			if len(fIndexes) <= f.MaxFiles {
+				continue
+			}
+
 			// Sorting the file indexes so that we can purge the older files and keep
 			// only the number of files as configured by the user
 			sort.Sort(sort.IntSlice(fIndexes))
-			var toDelete []int
-			toDelete = fIndexes[0 : len(fIndexes)-f.MaxFiles]
+			toDelete := fIndexes[0 : len(fIndexes)-f.MaxFiles]
 			for _, fIndex := range toDelete {
 				fname := filepath.Join(f.path, fmt.Sprintf("%s.%d", f.baseFileName, fIndex))
 				os.RemoveAll(fname)

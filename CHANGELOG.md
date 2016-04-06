@@ -1,12 +1,61 @@
-## 0.3.1 (UNRELEASED)
+## 0.3.2 (UNRELEASED)
 
 IMPROVEMENTS:
-  * client: Added the allocation index environment variable [GH-896]
-  * client: Add environment variables for task name, allocation ID/Name [GH-869]
+  * core: Allow count zero task groups to enable blue/green deploys [GH-931]
+  * core: Job Deregister forces an evaluation for the job even if it doesn't
+    exist [GH-981]
+  * core: Rename successfully finished allocations to "Complete" rather than
+    "Dead" for clarity [GH-975]
+  * cli: `alloc-status` explains restart decisions [GH-984]
+  * cli: `node-status -self` queries the local node [GH-1004]
+  * cli: Destructive commands now require confirmation [GH-983]
+  * cli: `alloc-status` display is less verbose by default [GH-946]
+  * cli: `server-members` displays the current leader in each region [GH-935]
+  * cli: `run` has an `-output` flag to emit a JSON version of the job [GH-990]
+  * cli: New `inspect` command to display a submitted job's specification
+    [GH-952]
+  * cli: `node-status` display is less verbose by default and shows a node's
+    total resources [GH-946]
+  * client: Nomad fingerprinter to detect client's version [GH-965]
+  * client: Pass environment variables from host to exec based tasks [GH-970]
+  * client: Allow task's to be run as particular user [GH-950, GH-978]
+  * client: `artifact` block now supports downloading paths relative to the
+    task's directory [GH-944]
+  * discovery: Support script based health checks [GH-986]
+
+BUG FIXES:
+  * core: Fix issue where in-place updated allocation double counted resources
+    [GH-957]
+  * core: Prevent garbage collection of running batch jobs [GH-989]
+  * client: Tasks can interpret Meta set in the task group and job [GH-985]
+  * client: All tasks in a task group are killed when a task fails [GH-962]
+  * client: Fix common exec failures on CentOS and Amazon Linux [GH-1009]
+
+## 0.3.1
+
+__BACKWARDS INCOMPATIBILITIES:__
+  * Service names that dont conform to RFC-1123 and RFC-2782 will fail
+    validation. To fix, change service name to conform to the RFCs before
+    running the job [GH-915]
+  * Jobs that downloaded artifacts will have to be updated to the new syntax and
+    be resubmitted. The new syntax consolidates artifacts to the `task` rather
+    than being duplicated inside each driver config [GH-921]
+
+IMPROVEMENTS:
+  * cli: Validate job file schemas [GH-900]
+  * client: Add environment variables for task name, allocation ID/Name/Index
+    [GH-869, GH-896]
   * client: Starting task is retried under the restart policy if the error is
     recoverable [GH-859]
+  * client: Allow tasks to download artifacts, which can be archives, prior to
+    starting [GH-921]
+  * config: Validate Nomad configuration files [GH-910]
+  * config: Client config allows reserving resources [GH-910]
   * driver/docker: Support for ECR [GH-858]
   * driver/docker: Periodic Fingerprinting [GH-893]
+  * driver/docker: Preventing port reservation for log collection on Unix platforms [GH-897]
+  * driver/rkt: Pass DNS information to rkt driver [GH-892]
+  * jobspec: Require RFC-1123 and RFC-2782 valid service names [GH-915]
 
 BUG FIXES:
   * core: No longer cancel evaluations that are delayed in the plan queue
@@ -14,8 +63,11 @@ BUG FIXES:
   * api: Guard client/fs/ APIs from being accessed on a non-client node [GH-890]
   * client: Allow dashes in variable names during interprelation [GH-857]
   * client: Updating kill timeout adheres to operator specified maximum value [GH-878]
+  * client: Fix a case in which clients would pull but not run allocations
+    [GH-906]
   * consul: Remove concurrent map access [GH-874]
   * driver/exec: Stopping tasks with more than one pid in a cgroup [GH-855]
+  * executor/linux: Add /run/resolvconf/ to chroot so DNS works [GH-905]
 
 ## 0.3.0
 

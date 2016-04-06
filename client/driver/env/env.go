@@ -2,6 +2,7 @@ package env
 
 import (
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 
@@ -66,19 +67,21 @@ const (
 // TaskEnvironment is used to expose information to a task via environment
 // variables and provide interpolation of Nomad variables.
 type TaskEnvironment struct {
-	Env        map[string]string
-	Meta       map[string]string
-	AllocDir   string
-	TaskDir    string
-	CpuLimit   int
-	MemLimit   int
-	TaskName   string
-	AllocIndex int
-	AllocId    string
-	AllocName  string
-	Node       *structs.Node
-	Networks   []*structs.NetworkResource
-	PortMap    map[string]int
+	Env           map[string]string
+	TaskMeta      map[string]string
+	TaskGroupMeta map[string]string
+	JobMeta       map[string]string
+	AllocDir      string
+	TaskDir       string
+	CpuLimit      int
+	MemLimit      int
+	TaskName      string
+	AllocIndex    int
+	AllocId       string
+	AllocName     string
+	Node          *structs.Node
+	Networks      []*structs.NetworkResource
+	PortMap       map[string]int
 
 	// taskEnv is the variables that will be set in the tasks environment
 	TaskEnv map[string]string
@@ -115,9 +118,11 @@ func (t *TaskEnvironment) Build() *TaskEnvironment {
 	t.NodeValues = make(map[string]string)
 	t.TaskEnv = make(map[string]string)
 
-	// Build the task metadata
-	for k, v := range t.Meta {
-		t.TaskEnv[fmt.Sprintf("%s%s", MetaPrefix, strings.ToUpper(k))] = v
+	// Build the meta with the following precedence: task, task group, job.
+	for _, meta := range []map[string]string{t.JobMeta, t.TaskGroupMeta, t.TaskMeta} {
+		for k, v := range meta {
+			t.TaskEnv[fmt.Sprintf("%s%s", MetaPrefix, strings.ToUpper(k))] = v
+		}
 	}
 
 	// Build the ports
@@ -278,13 +283,33 @@ func (t *TaskEnvironment) clearPortMap() *TaskEnvironment {
 
 // Takes a map of meta values to be passed to the task. The keys are capatilized
 // when the environent variable is set.
-func (t *TaskEnvironment) SetMeta(m map[string]string) *TaskEnvironment {
-	t.Meta = m
+func (t *TaskEnvironment) SetTaskMeta(m map[string]string) *TaskEnvironment {
+	t.TaskMeta = m
 	return t
 }
 
-func (t *TaskEnvironment) ClearMeta() *TaskEnvironment {
-	t.Meta = nil
+func (t *TaskEnvironment) ClearTaskMeta() *TaskEnvironment {
+	t.TaskMeta = nil
+	return t
+}
+
+func (t *TaskEnvironment) SetTaskGroupMeta(m map[string]string) *TaskEnvironment {
+	t.TaskGroupMeta = m
+	return t
+}
+
+func (t *TaskEnvironment) ClearTaskGroupMeta() *TaskEnvironment {
+	t.TaskGroupMeta = nil
+	return t
+}
+
+func (t *TaskEnvironment) SetJobMeta(m map[string]string) *TaskEnvironment {
+	t.JobMeta = m
+	return t
+}
+
+func (t *TaskEnvironment) ClearJobMeta() *TaskEnvironment {
+	t.JobMeta = nil
 	return t
 }
 
@@ -302,6 +327,39 @@ func (t *TaskEnvironment) AppendEnvvars(m map[string]string) *TaskEnvironment {
 	for k, v := range m {
 		t.Env[k] = v
 	}
+	return t
+}
+
+// AppendHostEnvvars adds the host environment variables to the tasks. The
+// filter parameter can be use to filter host environment from entering the
+// tasks.
+func (t *TaskEnvironment) AppendHostEnvvars(filter []string) *TaskEnvironment {
+	hostEnv := os.Environ()
+	if t.Env == nil {
+		t.Env = make(map[string]string, len(hostEnv))
+	}
+
+	// Index the filtered environment variables.
+	index := make(map[string]struct{}, len(filter))
+	for _, f := range filter {
+		index[f] = struct{}{}
+	}
+
+	for _, e := range hostEnv {
+		parts := strings.Split(e, "=")
+		key, value := parts[0], parts[1]
+
+		// Skip filtered environment variables
+		if _, filtered := index[key]; filtered {
+			continue
+		}
+
+		// Don't override the tasks environment variables.
+		if _, existing := t.Env[key]; !existing {
+			t.Env[key] = value
+		}
+	}
+
 	return t
 }
 
