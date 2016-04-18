@@ -97,6 +97,12 @@ The following options are available for use in the job specification.
 
 * `auth` - (Optional) Provide authentication for a private registry (see below).
 
+* `tty` - (Optional) `true` or `false` (default). Allocate a pseudo-TTY for the
+  container.
+
+* `interactive` - (Optional) `true` or `false` (default). Keep STDIN open on
+  the container.
+
 ### Container Name
 
 Nomad creates a container after pulling an image. Containers are named
@@ -275,9 +281,6 @@ options](/docs/agent/config.html#options):
   the docker daemon. `docker.endpoint` must also be specified or this setting
   will be ignored.
 
-* `docker.cleanup.container` Defaults to `true`. Changing this to `false` will
-  prevent Nomad from removing containers from stopped tasks.
-
 * `docker.cleanup.image` Defaults to `true`. Changing this to `false` will
   prevent Nomad from removing images from stopped tasks.
 
@@ -303,7 +306,6 @@ An example is given below:
 ```
     client {
         options = {
-            "docker.cleanup.container" = "false"
             "docker.cleanup.image" = "false"
         }
     }

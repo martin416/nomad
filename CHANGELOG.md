@@ -2,11 +2,14 @@
 
 IMPROVEMENTS:
   * core: Allow count zero task groups to enable blue/green deploys [GH-931]
+  * core: Validate driver configurations when submitting jobs [GH-1062, GH-1089]
   * core: Job Deregister forces an evaluation for the job even if it doesn't
     exist [GH-981]
   * core: Rename successfully finished allocations to "Complete" rather than
     "Dead" for clarity [GH-975]
+  * core: Garbage collection partitioned to avoid system delays [GH-1012]
   * cli: `alloc-status` explains restart decisions [GH-984]
+  * cli: `node-drain -self` drains the local node [GH-1068]
   * cli: `node-status -self` queries the local node [GH-1004]
   * cli: Destructive commands now require confirmation [GH-983]
   * cli: `alloc-status` display is less verbose by default [GH-946]
@@ -16,22 +19,31 @@ IMPROVEMENTS:
     [GH-952]
   * cli: `node-status` display is less verbose by default and shows a node's
     total resources [GH-946]
+  * client: `artifact` source can be interpreted [GH-1070]
+  * client: Add IP and Port environment variables [GH-1099]
   * client: Nomad fingerprinter to detect client's version [GH-965]
+  * client: Tasks can interpret Meta set in the task group and job [GH-985]
+  * client: All tasks in a task group are killed when a task fails [GH-962]
   * client: Pass environment variables from host to exec based tasks [GH-970]
   * client: Allow task's to be run as particular user [GH-950, GH-978]
   * client: `artifact` block now supports downloading paths relative to the
     task's directory [GH-944]
   * discovery: Support script based health checks [GH-986]
+  * discovery: Allowing registration of services which don't expose ports
+    [GH-1092]
+  * driver/docker: Support for `tty` and `interactive` options [GH-1059]
+  * periodic: Periodic jobs are always evaluated in UTC timezone [GH-1074]
 
 BUG FIXES:
   * core: Fix issue where in-place updated allocation double counted resources
     [GH-957]
   * core: Prevent garbage collection of running batch jobs [GH-989]
-  * client: Tasks can interpret Meta set in the task group and job [GH-985]
-  * client: All tasks in a task group are killed when a task fails [GH-962]
+  * core: Fix drained, batched allocations from being migrated indefinitely
+    [GH-1086]
+  * client: Garbage collect Docker containers on exit [GH-1071]
   * client: Fix common exec failures on CentOS and Amazon Linux [GH-1009]
 
-## 0.3.1
+## 0.3.1 (Mars 16, 2016)
 
 __BACKWARDS INCOMPATIBILITIES:__
   * Service names that dont conform to RFC-1123 and RFC-2782 will fail
@@ -69,7 +81,7 @@ BUG FIXES:
   * driver/exec: Stopping tasks with more than one pid in a cgroup [GH-855]
   * executor/linux: Add /run/resolvconf/ to chroot so DNS works [GH-905]
 
-## 0.3.0
+## 0.3.0 (February 25, 2016)
 
 __BACKWARDS INCOMPATIBILITIES:__
   * Stdout and Stderr log files of tasks have moved from task/local to

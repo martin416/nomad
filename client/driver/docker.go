@@ -23,6 +23,7 @@ import (
 	"github.com/hashicorp/nomad/client/driver/executor"
 	cstructs "github.com/hashicorp/nomad/client/driver/structs"
 	"github.com/hashicorp/nomad/helper/discover"
+	"github.com/hashicorp/nomad/helper/fields"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/mitchellh/mapstructure"
 )
@@ -73,6 +74,8 @@ type DockerDriverConfig struct {
 	Labels           map[string]string   `mapstructure:"-"`                  // Labels to set when the container starts up
 	Auth             []DockerDriverAuth  `mapstructure:"auth"`               // Authentication credentials for a private Docker registry
 	SSL              bool                `mapstructure:"ssl"`                // Flag indicating repository is served via https
+	TTY              bool                `mapstructure:"tty"`                // Allocate a Pseudo-TTY
+	Interactive      bool                `mapstructure:"interactive"`        // Keep STDIN open even if not attached
 }
 
 func (c *DockerDriverConfig) Init() error {
@@ -105,23 +108,92 @@ type dockerPID struct {
 }
 
 type DockerHandle struct {
-	pluginClient     *plugin.Client
-	executor         executor.Executor
-	client           *docker.Client
-	logger           *log.Logger
-	cleanupContainer bool
-	cleanupImage     bool
-	imageID          string
-	containerID      string
-	version          string
-	killTimeout      time.Duration
-	maxKillTimeout   time.Duration
-	waitCh           chan *cstructs.WaitResult
-	doneCh           chan struct{}
+	pluginClient   *plugin.Client
+	executor       executor.Executor
+	client         *docker.Client
+	logger         *log.Logger
+	cleanupImage   bool
+	imageID        string
+	containerID    string
+	version        string
+	killTimeout    time.Duration
+	maxKillTimeout time.Duration
+	waitCh         chan *cstructs.WaitResult
+	doneCh         chan struct{}
 }
 
 func NewDockerDriver(ctx *DriverContext) Driver {
 	return &DockerDriver{DriverContext: *ctx}
+}
+
+// Validate is used to validate the driver configuration
+func (d *DockerDriver) Validate(config map[string]interface{}) error {
+	fd := &fields.FieldData{
+		Raw: config,
+		Schema: map[string]*fields.FieldSchema{
+			"image": &fields.FieldSchema{
+				Type:     fields.TypeString,
+				Required: true,
+			},
+			"load": &fields.FieldSchema{
+				Type: fields.TypeArray,
+			},
+			"command": &fields.FieldSchema{
+				Type: fields.TypeString,
+			},
+			"args": &fields.FieldSchema{
+				Type: fields.TypeArray,
+			},
+			"ipc_mode": &fields.FieldSchema{
+				Type: fields.TypeString,
+			},
+			"network_mode": &fields.FieldSchema{
+				Type: fields.TypeString,
+			},
+			"pid_mode": &fields.FieldSchema{
+				Type: fields.TypeString,
+			},
+			"uts_mode": &fields.FieldSchema{
+				Type: fields.TypeString,
+			},
+			"port_map": &fields.FieldSchema{
+				Type: fields.TypeArray,
+			},
+			"privileged": &fields.FieldSchema{
+				Type: fields.TypeBool,
+			},
+			"dns_servers": &fields.FieldSchema{
+				Type: fields.TypeArray,
+			},
+			"dns_search_domains": &fields.FieldSchema{
+				Type: fields.TypeArray,
+			},
+			"hostname": &fields.FieldSchema{
+				Type: fields.TypeString,
+			},
+			"labels": &fields.FieldSchema{
+				Type: fields.TypeMap,
+			},
+			"auth": &fields.FieldSchema{
+				Type: fields.TypeArray,
+			},
+			"ssl": &fields.FieldSchema{
+				Type: fields.TypeBool,
+			},
+			"tty": &fields.FieldSchema{
+				Type: fields.TypeBool,
+			},
+			"interactive": &fields.FieldSchema{
+				Type: fields.TypeBool,
+			},
+		},
+	}
+
+	if err := fd.Validate(); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // dockerClient creates *docker.Client. In test / dev mode we can use ENV vars
@@ -234,9 +306,11 @@ func (d *DockerDriver) createContainer(ctx *ExecContext, task *structs.Task,
 	d.taskEnv.SetTaskLocalDir(filepath.Join("/", allocdir.TaskLocal))
 
 	config := &docker.Config{
-		Image:    driverConfig.ImageName,
-		Hostname: driverConfig.Hostname,
-		User:     task.User,
+		Image:     driverConfig.ImageName,
+		Hostname:  driverConfig.Hostname,
+		User:      task.User,
+		Tty:       driverConfig.TTY,
+		OpenStdin: driverConfig.Interactive,
 	}
 
 	hostConfig := &docker.HostConfig{
@@ -542,7 +616,6 @@ func (d *DockerDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle
 		return nil, err
 	}
 
-	cleanupContainer := d.config.ReadBoolDefault("docker.cleanup.container", true)
 	cleanupImage := d.config.ReadBoolDefault("docker.cleanup.image", true)
 
 	taskDir, ok := ctx.AllocDir.TaskDirs[d.DriverContext.taskName]
@@ -670,19 +743,18 @@ func (d *DockerDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle
 	// Return a driver handle
 	maxKill := d.DriverContext.config.MaxKillTimeout
 	h := &DockerHandle{
-		client:           client,
-		executor:         exec,
-		pluginClient:     pluginClient,
-		cleanupContainer: cleanupContainer,
-		cleanupImage:     cleanupImage,
-		logger:           d.logger,
-		imageID:          dockerImage.ID,
-		containerID:      container.ID,
-		version:          d.config.Version,
-		killTimeout:      GetKillTimeout(task.KillTimeout, maxKill),
-		maxKillTimeout:   maxKill,
-		doneCh:           make(chan struct{}),
-		waitCh:           make(chan *cstructs.WaitResult, 1),
+		client:         client,
+		executor:       exec,
+		pluginClient:   pluginClient,
+		cleanupImage:   cleanupImage,
+		logger:         d.logger,
+		imageID:        dockerImage.ID,
+		containerID:    container.ID,
+		version:        d.config.Version,
+		killTimeout:    GetKillTimeout(task.KillTimeout, maxKill),
+		maxKillTimeout: maxKill,
+		doneCh:         make(chan struct{}),
+		waitCh:         make(chan *cstructs.WaitResult, 1),
 	}
 	if err := exec.SyncServices(consulContext(d.config, container.ID)); err != nil {
 		d.logger.Printf("[ERR] driver.docker: error registering services with consul for task: %q: %v", task.Name, err)
@@ -692,7 +764,6 @@ func (d *DockerDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle
 }
 
 func (d *DockerDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, error) {
-	cleanupContainer := d.config.ReadBoolDefault("docker.cleanup.container", true)
 	cleanupImage := d.config.ReadBoolDefault("docker.cleanup.image", true)
 
 	// Split the handle
@@ -745,19 +816,18 @@ func (d *DockerDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, er
 
 	// Return a driver handle
 	h := &DockerHandle{
-		client:           client,
-		executor:         exec,
-		pluginClient:     pluginClient,
-		cleanupContainer: cleanupContainer,
-		cleanupImage:     cleanupImage,
-		logger:           d.logger,
-		imageID:          pid.ImageID,
-		containerID:      pid.ContainerID,
-		version:          pid.Version,
-		killTimeout:      pid.KillTimeout,
-		maxKillTimeout:   pid.MaxKillTimeout,
-		doneCh:           make(chan struct{}),
-		waitCh:           make(chan *cstructs.WaitResult, 1),
+		client:         client,
+		executor:       exec,
+		pluginClient:   pluginClient,
+		cleanupImage:   cleanupImage,
+		logger:         d.logger,
+		imageID:        pid.ImageID,
+		containerID:    pid.ContainerID,
+		version:        pid.Version,
+		killTimeout:    pid.KillTimeout,
+		maxKillTimeout: pid.MaxKillTimeout,
+		doneCh:         make(chan struct{}),
+		waitCh:         make(chan *cstructs.WaitResult, 1),
 	}
 	if err := exec.SyncServices(consulContext(d.config, pid.ContainerID)); err != nil {
 		h.logger.Printf("[ERR] driver.docker: error registering services with consul: %v", err)
@@ -808,59 +878,18 @@ func (h *DockerHandle) Kill() error {
 	// Stop the container
 	err := h.client.StopContainer(h.containerID, uint(h.killTimeout.Seconds()))
 	if err != nil {
+		h.executor.Exit()
+		h.pluginClient.Kill()
+
 		// Container has already been removed.
 		if strings.Contains(err.Error(), NoSuchContainerError) {
 			h.logger.Printf("[DEBUG] driver.docker: attempted to stop non-existent container %s", h.containerID)
-			h.executor.Exit()
-			h.pluginClient.Kill()
 			return nil
 		}
 		h.logger.Printf("[ERR] driver.docker: failed to stop container %s: %v", h.containerID, err)
-		h.executor.Exit()
-		h.pluginClient.Kill()
 		return fmt.Errorf("Failed to stop container %s: %s", h.containerID, err)
 	}
 	h.logger.Printf("[INFO] driver.docker: stopped container %s", h.containerID)
-
-	// Cleanup container
-	if h.cleanupContainer {
-		err = h.client.RemoveContainer(docker.RemoveContainerOptions{
-			ID:            h.containerID,
-			RemoveVolumes: true,
-		})
-		if err != nil {
-			h.logger.Printf("[ERR] driver.docker: failed to remove container %s", h.containerID)
-			return fmt.Errorf("Failed to remove container %s: %s", h.containerID, err)
-		}
-		h.logger.Printf("[INFO] driver.docker: removed container %s", h.containerID)
-	}
-
-	// Cleanup image. This operation may fail if the image is in use by another
-	// job. That is OK. Will we log a message but continue.
-	if h.cleanupImage {
-		err = h.client.RemoveImage(h.imageID)
-		if err != nil {
-			containers, err := h.client.ListContainers(docker.ListContainersOptions{
-				// The image might be in use by a stopped container, so check everything
-				All: true,
-				Filters: map[string][]string{
-					"image": []string{h.imageID},
-				},
-			})
-			if err != nil {
-				h.logger.Printf("[ERR] driver.docker: failed to query list of containers matching image:%s", h.imageID)
-				return fmt.Errorf("Failed to query list of containers: %s", err)
-			}
-			inUse := len(containers)
-			if inUse > 0 {
-				h.logger.Printf("[INFO] driver.docker: image %s is still in use by %d container(s)", h.imageID, inUse)
-			} else {
-				return fmt.Errorf("Failed to remove image %s", h.imageID)
-			}
-		} else {
-			h.logger.Printf("[INFO] driver.docker: removed image %s", h.imageID)
-		}
-	}
 	return nil
 }
 
@@ -889,4 +918,26 @@ func (h *DockerHandle) run() {
 		h.logger.Printf("[ERR] driver.docker: failed to kill the syslog collector: %v", err)
 	}
 	h.pluginClient.Kill()
+
+	// Stop the container just incase the docker daemon's wait returned
+	// incorrectly
+	if err := h.client.StopContainer(h.containerID, 0); err != nil {
+		_, noSuchContainer := err.(*docker.NoSuchContainer)
+		_, containerNotRunning := err.(*docker.ContainerNotRunning)
+		if !containerNotRunning && !noSuchContainer {
+			h.logger.Printf("[ERR] driver.docker: error stopping container: %v", err)
+		}
+	}
+
+	// Remove the container
+	if err := h.client.RemoveContainer(docker.RemoveContainerOptions{ID: h.containerID, Force: true}); err != nil {
+		h.logger.Printf("[ERR] driver.docker: error removing container: %v", err)
+	}
+
+	// Cleanup the image
+	if h.cleanupImage {
+		if err := h.client.RemoveImage(h.imageID); err != nil {
+			h.logger.Printf("[DEBUG] driver.docker: error removing image: %v", err)
+		}
+	}
 }

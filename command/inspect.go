@@ -1,8 +1,11 @@
 package command
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/hashicorp/nomad/api"
 )
 
 type InspectCommand struct {
@@ -59,7 +62,7 @@ func (c *InspectCommand) Run(args []string) int {
 		c.Ui.Error(fmt.Sprintf("No job(s) with prefix or id %q found", jobID))
 		return 1
 	}
-	if len(jobs) > 1 {
+	if len(jobs) > 1 && strings.TrimSpace(jobID) != jobs[0].ID {
 		out := make([]string, len(jobs)+1)
 		out[0] = "ID|Type|Priority|Status"
 		for i, job := range jobs {
@@ -74,13 +77,20 @@ func (c *InspectCommand) Run(args []string) int {
 	}
 
 	// Prefix lookup matched a single job
-	job, _, err := client.Jobs().RawJob(jobs[0].ID, nil)
+	job, _, err := client.Jobs().Info(jobs[0].ID, nil)
 	if err != nil {
 		c.Ui.Error(fmt.Sprintf("Error inspecting job: %s", err))
 		return 1
 	}
 
 	// Print the contents of the job
-	c.Ui.Output(job)
+	req := api.RegisterJobRequest{job}
+	buf, err := json.MarshalIndent(req, "", "    ")
+	if err != nil {
+		c.Ui.Error(fmt.Sprintf("Error converting job: %s", err))
+		return 1
+	}
+
+	c.Ui.Output(string(buf))
 	return 0
 }

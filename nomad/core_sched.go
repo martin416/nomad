@@ -10,6 +10,13 @@ import (
 	"github.com/hashicorp/nomad/scheduler"
 )
 
+var (
+	// maxIdsPerReap is the maximum number of evals and allocations to reap in a
+	// single Raft transaction. This is to ensure that the Raft message does not
+	// become too large.
+	maxIdsPerReap = (1024 * 256) / 36 // 0.25 MB of ids.
+)
+
 // CoreScheduler is a special "scheduler" that is registered
 // as "_core". It is used to run various administrative work
 // across the cluster.
@@ -28,17 +35,33 @@ func NewCoreScheduler(srv *Server, snap *state.StateSnapshot) scheduler.Schedule
 }
 
 // Process is used to implement the scheduler.Scheduler interface
-func (s *CoreScheduler) Process(eval *structs.Evaluation) error {
+func (c *CoreScheduler) Process(eval *structs.Evaluation) error {
 	switch eval.JobID {
 	case structs.CoreJobEvalGC:
-		return s.evalGC(eval)
+		return c.evalGC(eval)
 	case structs.CoreJobNodeGC:
-		return s.nodeGC(eval)
+		return c.nodeGC(eval)
 	case structs.CoreJobJobGC:
-		return s.jobGC(eval)
+		return c.jobGC(eval)
+	case structs.CoreJobForceGC:
+		return c.forceGC(eval)
 	default:
 		return fmt.Errorf("core scheduler cannot handle job '%s'", eval.JobID)
 	}
+}
+
+// forceGC is used to garbage collect all eligible objects.
+func (c *CoreScheduler) forceGC(eval *structs.Evaluation) error {
+	if err := c.jobGC(eval); err != nil {
+		return err
+	}
+	if err := c.evalGC(eval); err != nil {
+		return err
+	}
+
+	// Node GC must occur after the others to ensure the allocations are
+	// cleared.
+	return c.nodeGC(eval)
 }
 
 // jobGC is used to garbage collect eligible jobs.
@@ -50,7 +73,7 @@ func (c *CoreScheduler) jobGC(eval *structs.Evaluation) error {
 	}
 
 	var oldThreshold uint64
-	if eval.TriggeredBy == structs.EvalTriggerForceGC {
+	if eval.JobID == structs.CoreJobForceGC {
 		// The GC was forced, so set the threshold to its maximum so everything
 		// will GC.
 		oldThreshold = math.MaxUint64
@@ -60,9 +83,9 @@ func (c *CoreScheduler) jobGC(eval *structs.Evaluation) error {
 		tt := c.srv.fsm.TimeTable()
 		cutoff := time.Now().UTC().Add(-1 * c.srv.config.JobGCThreshold)
 		oldThreshold = tt.NearestIndex(cutoff)
+		c.srv.logger.Printf("[DEBUG] sched.core: job GC: scanning before index %d (%v)",
+			oldThreshold, c.srv.config.JobGCThreshold)
 	}
-	c.srv.logger.Printf("[DEBUG] sched.core: job GC: scanning before index %d (%v)",
-		oldThreshold, c.srv.config.JobGCThreshold)
 
 	// Collect the allocations, evaluations and jobs to GC
 	var gcAlloc, gcEval, gcJob []string
@@ -137,7 +160,7 @@ func (c *CoreScheduler) evalGC(eval *structs.Evaluation) error {
 	}
 
 	var oldThreshold uint64
-	if eval.TriggeredBy == structs.EvalTriggerForceGC {
+	if eval.JobID == structs.CoreJobForceGC {
 		// The GC was forced, so set the threshold to its maximum so everything
 		// will GC.
 		oldThreshold = math.MaxUint64
@@ -149,9 +172,9 @@ func (c *CoreScheduler) evalGC(eval *structs.Evaluation) error {
 		tt := c.srv.fsm.TimeTable()
 		cutoff := time.Now().UTC().Add(-1 * c.srv.config.EvalGCThreshold)
 		oldThreshold = tt.NearestIndex(cutoff)
+		c.srv.logger.Printf("[DEBUG] sched.core: eval GC: scanning before index %d (%v)",
+			oldThreshold, c.srv.config.EvalGCThreshold)
 	}
-	c.srv.logger.Printf("[DEBUG] sched.core: eval GC: scanning before index %d (%v)",
-		oldThreshold, c.srv.config.EvalGCThreshold)
 
 	// Collect the allocations and evaluations to GC
 	var gcAlloc, gcEval []string
@@ -163,12 +186,22 @@ func (c *CoreScheduler) evalGC(eval *structs.Evaluation) error {
 			return err
 		}
 
-		// If the eval is from a "batch" job we don't want to garbage collect
-		// its allocations. If there is a long running batch job and its
+		// If the eval is from a running "batch" job we don't want to garbage
+		// collect its allocations. If there is a long running batch job and its
 		// terminal allocations get GC'd the scheduler would re-run the
 		// allocations.
-		if len(allocs) != 0 && eval.Type == structs.JobTypeBatch {
-			continue
+		if eval.Type == structs.JobTypeBatch {
+			// Check if the job is running
+			job, err := c.snap.JobByID(eval.JobID)
+			if err != nil {
+				return err
+			}
+
+			// If the job has been deregistered, we want to garbage collect the
+			// allocations and evaluations.
+			if job != nil && len(allocs) != 0 {
+				continue
+			}
 		}
 
 		if gc {
@@ -209,12 +242,7 @@ func (c *CoreScheduler) gcEval(eval *structs.Evaluation, thresholdIndex uint64) 
 
 	// Scan the allocations to ensure they are terminal and old
 	for _, alloc := range allocs {
-		// TODO: This can go away once the scheduler marks an alloc as
-		// DesiredStatusStop when a client fails.
-		allocTerminal := alloc.TerminalStatus() ||
-			alloc.ClientStatus == structs.AllocClientStatusComplete ||
-			alloc.ClientStatus == structs.AllocClientStatusFailed
-		if !allocTerminal || alloc.ModifyIndex > thresholdIndex {
+		if !alloc.TerminalStatus() || alloc.ModifyIndex > thresholdIndex {
 			return false, nil, nil
 		}
 	}
@@ -232,20 +260,60 @@ func (c *CoreScheduler) gcEval(eval *structs.Evaluation, thresholdIndex uint64) 
 // allocs.
 func (c *CoreScheduler) evalReap(evals, allocs []string) error {
 	// Call to the leader to issue the reap
-	req := structs.EvalDeleteRequest{
-		Evals:  evals,
-		Allocs: allocs,
-		WriteRequest: structs.WriteRequest{
-			Region: c.srv.config.Region,
-		},
-	}
-	var resp structs.GenericResponse
-	if err := c.srv.RPC("Eval.Reap", &req, &resp); err != nil {
-		c.srv.logger.Printf("[ERR] sched.core: eval reap failed: %v", err)
-		return err
+	for _, req := range c.partitionReap(evals, allocs) {
+		var resp structs.GenericResponse
+		if err := c.srv.RPC("Eval.Reap", req, &resp); err != nil {
+			c.srv.logger.Printf("[ERR] sched.core: eval reap failed: %v", err)
+			return err
+		}
 	}
 
 	return nil
+}
+
+// partitionReap returns a list of EvalDeleteRequest to make, ensuring a single
+// request does not contain too many allocations and evaluations. This is
+// necessary to ensure that the Raft transaction does not become too large.
+func (c *CoreScheduler) partitionReap(evals, allocs []string) []*structs.EvalDeleteRequest {
+	var requests []*structs.EvalDeleteRequest
+	submittedEvals, submittedAllocs := 0, 0
+	for submittedEvals != len(evals) || submittedAllocs != len(allocs) {
+		req := &structs.EvalDeleteRequest{
+			WriteRequest: structs.WriteRequest{
+				Region: c.srv.config.Region,
+			},
+		}
+		requests = append(requests, req)
+		available := maxIdsPerReap
+
+		// Add the allocs first
+		if remaining := len(allocs) - submittedAllocs; remaining > 0 {
+			if remaining <= available {
+				req.Allocs = allocs[submittedAllocs:]
+				available -= remaining
+				submittedAllocs += remaining
+			} else {
+				req.Allocs = allocs[submittedAllocs : submittedAllocs+available]
+				submittedAllocs += available
+
+				// Exhausted space so skip adding evals
+				continue
+			}
+		}
+
+		// Add the evals
+		if remaining := len(evals) - submittedEvals; remaining > 0 {
+			if remaining <= available {
+				req.Evals = evals[submittedEvals:]
+				submittedEvals += remaining
+			} else {
+				req.Evals = evals[submittedEvals : submittedEvals+available]
+				submittedEvals += available
+			}
+		}
+	}
+
+	return requests
 }
 
 // nodeGC is used to garbage collect old nodes
@@ -257,7 +325,7 @@ func (c *CoreScheduler) nodeGC(eval *structs.Evaluation) error {
 	}
 
 	var oldThreshold uint64
-	if eval.TriggeredBy == structs.EvalTriggerForceGC {
+	if eval.JobID == structs.CoreJobForceGC {
 		// The GC was forced, so set the threshold to its maximum so everything
 		// will GC.
 		oldThreshold = math.MaxUint64
@@ -269,9 +337,9 @@ func (c *CoreScheduler) nodeGC(eval *structs.Evaluation) error {
 		tt := c.srv.fsm.TimeTable()
 		cutoff := time.Now().UTC().Add(-1 * c.srv.config.NodeGCThreshold)
 		oldThreshold = tt.NearestIndex(cutoff)
+		c.srv.logger.Printf("[DEBUG] sched.core: node GC: scanning before index %d (%v)",
+			oldThreshold, c.srv.config.NodeGCThreshold)
 	}
-	c.srv.logger.Printf("[DEBUG] sched.core: node GC: scanning before index %d (%v)",
-		oldThreshold, c.srv.config.NodeGCThreshold)
 
 	// Collect the nodes to GC
 	var gcNode []string

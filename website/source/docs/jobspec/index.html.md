@@ -174,7 +174,9 @@ The `job` object supports the following keys:
     ```
 
 *   `periodic` - `periodic` allows the job to be scheduled at fixed times, dates
-    or intervals. The `periodic` block supports the following keys:
+    or intervals. The periodic expression is always evaluated in the UTC
+    timezone to ensure consistent evaluation when Nomad Servers span multiple
+    time zones. The `periodic` block supports the following keys:
 
     * `enabled` - `enabled` determines whether the periodic job will spawn child
     jobs. `enabled` is defaulted to true if the block is included.
@@ -206,7 +208,7 @@ The `job` object supports the following keys:
 The `group` object supports the following keys:
 
 * `count` - Specifies the number of the task groups that should
-  be running. Must be positive, defaults to one.
+  be running. Must be non-negative, defaults to one.
 
 * `constraint` - This can be provided multiple times to define additional
   constraints. See the constraint reference for more details.
@@ -218,7 +220,7 @@ The `group` object supports the following keys:
 * `task` - This can be specified multiple times, to add a task as
   part of the group.
 
-* `meta` - Annotates the task group with opaque metadata.
+* `meta` - A key/value map that annotates the task group with opaque metadata.
 
 ### Task
 
@@ -430,7 +432,7 @@ Nomad allows downloading `http`, `https`, and `S3` artifacts. If these artifacts
 are archives (zip, tar.gz, bz2, etc.), these will be unarchived before the task
 is started.
 
-The `artifact` object maps supports the following keys:
+The `artifact` object supports the following keys:
 
 * `source` - The path to the artifact to download.
 
@@ -477,5 +479,3 @@ the lack of comments. Otherwise, the two are completely interoperable.
 
 See the [JSON API documentation](/docs/jobspec/json.html) for more details on
 the JSON structure.
-
-

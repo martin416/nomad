@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/url"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -1980,11 +1979,6 @@ func (ta *TaskArtifact) Validate() error {
 	var mErr multierror.Error
 	if ta.GetterSource == "" {
 		mErr.Errors = append(mErr.Errors, fmt.Errorf("source must be specified"))
-	} else {
-		_, err := url.Parse(ta.GetterSource)
-		if err != nil {
-			mErr.Errors = append(mErr.Errors, fmt.Errorf("invalid source URL %q: %v", ta.GetterSource, err))
-		}
 	}
 
 	// Verify the destination doesn't escape the tasks directory
@@ -2230,6 +2224,12 @@ func (a *Allocation) TerminalStatus() bool {
 	case AllocDesiredStatusStop, AllocDesiredStatusEvict, AllocDesiredStatusFailed:
 		return true
 	default:
+	}
+
+	switch a.ClientStatus {
+	case AllocClientStatusComplete, AllocClientStatusFailed:
+		return true
+	default:
 		return false
 	}
 }
@@ -2435,7 +2435,6 @@ const (
 	EvalTriggerPeriodicJob   = "periodic-job"
 	EvalTriggerNodeUpdate    = "node-update"
 	EvalTriggerScheduled     = "scheduled"
-	EvalTriggerForceGC       = "force-gc"
 	EvalTriggerRollingUpdate = "rolling-update"
 )
 
@@ -2456,6 +2455,9 @@ const (
 	// evaluations and allocations are terminal. If so, we delete these out of
 	// the system.
 	CoreJobJobGC = "job-gc"
+
+	// CoreJobForceGC is used to force garbage collection of all GCable objects.
+	CoreJobForceGC = "force-gc"
 )
 
 // Evaluation is used anytime we need to apply business logic as a result
