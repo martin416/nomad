@@ -1,13 +1,13 @@
-## 0.3.2 (UNRELEASED)
+## 0.3.2 (April 22, 2016)
 
 IMPROVEMENTS:
+  * core: Garbage collection partitioned to avoid system delays [GH-1012]
   * core: Allow count zero task groups to enable blue/green deploys [GH-931]
   * core: Validate driver configurations when submitting jobs [GH-1062, GH-1089]
   * core: Job Deregister forces an evaluation for the job even if it doesn't
     exist [GH-981]
   * core: Rename successfully finished allocations to "Complete" rather than
     "Dead" for clarity [GH-975]
-  * core: Garbage collection partitioned to avoid system delays [GH-1012]
   * cli: `alloc-status` explains restart decisions [GH-984]
   * cli: `node-drain -self` drains the local node [GH-1068]
   * cli: `node-status -self` queries the local node [GH-1004]
@@ -28,22 +28,29 @@ IMPROVEMENTS:
   * client: Allow task's to be run as particular user [GH-950, GH-978]
   * client: `artifact` block now supports downloading paths relative to the
     task's directory [GH-944]
+  * docker: Timeout communications with Docker Daemon to avoid deadlocks with
+    misbehaving Docker Daemon [GH-1117]
   * discovery: Support script based health checks [GH-986]
   * discovery: Allowing registration of services which don't expose ports
     [GH-1092]
   * driver/docker: Support for `tty` and `interactive` options [GH-1059]
+  * jobspec: Improved validation of services referencing port labels [GH-1097]
   * periodic: Periodic jobs are always evaluated in UTC timezone [GH-1074]
 
 BUG FIXES:
+  * core: Prevent garbage collection of running batch jobs [GH-989]
+  * core: Trigger System scheduler when Node drain is disabled [GH-1106]
   * core: Fix issue where in-place updated allocation double counted resources
     [GH-957]
-  * core: Prevent garbage collection of running batch jobs [GH-989]
   * core: Fix drained, batched allocations from being migrated indefinitely
     [GH-1086]
   * client: Garbage collect Docker containers on exit [GH-1071]
   * client: Fix common exec failures on CentOS and Amazon Linux [GH-1009]
+  * client: Fix S3 artifact downloading with IAM credentials [GH-1113]
+  * client: Fix handling of environment variables containing multiple equal
+    signs [GH-1115]
 
-## 0.3.1 (Mars 16, 2016)
+## 0.3.1 (March 16, 2016)
 
 __BACKWARDS INCOMPATIBILITIES:__
   * Service names that dont conform to RFC-1123 and RFC-2782 will fail
