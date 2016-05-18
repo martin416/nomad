@@ -209,6 +209,14 @@ type JobListRequest struct {
 	QueryOptions
 }
 
+// JobPlanRequest is used for the Job.Plan endpoint to trigger a dry-run
+// evaluation of the Job.
+type JobPlanRequest struct {
+	Job  *Job
+	Diff bool // Toggles an annotated diff
+	WriteRequest
+}
+
 // NodeListRequest is used to parameterize a list request
 type NodeListRequest struct {
 	QueryOptions
@@ -388,6 +396,27 @@ type SingleJobResponse struct {
 type JobListResponse struct {
 	Jobs []*JobListStub
 	QueryMeta
+}
+
+// JobPlanResponse is used to respond to a job plan request
+type JobPlanResponse struct {
+	// Annotations stores annotations explaining decisions the scheduler made.
+	Annotations *PlanAnnotations
+
+	// JobModifyIndex is the modification index of the job. The value can be
+	// used when running `nomad run` to ensure that the Job wasn’t modified
+	// since the last plan. If the job is being created, the value is zero.
+	JobModifyIndex uint64
+
+	// CreatedEvals is the set of evaluations created by the scheduler. The
+	// reasons for this can be rolling-updates or blocked evals.
+	CreatedEvals []*Evaluation
+
+	// Diff contains the diff of the job and annotations on whether the change
+	// causes an in-place update or create/destroy
+	Diff *JobDiff
+
+	WriteMeta
 }
 
 // SingleAllocResponse is used to return a single allocation
@@ -1084,7 +1113,7 @@ const (
 	PeriodicSpecCron = "cron"
 
 	// PeriodicSpecTest is only used by unit tests. It is a sorted, comma
-	// seperated list of unix timestamps at which to launch.
+	// separated list of unix timestamps at which to launch.
 	PeriodicSpecTest = "_internal_test"
 )
 
@@ -1474,7 +1503,11 @@ const (
 	NomadConsulPrefix = "nomad-registered-service"
 )
 
-// The Service model represents a Consul service defintion
+var (
+	AgentServicePrefix = fmt.Sprintf("%s-%s", NomadConsulPrefix, "agent")
+)
+
+// The Service model represents a Consul service definition
 type Service struct {
 	Name      string          // Name of the service, defaults to id
 	Tags      []string        // List of tags for the service
@@ -1519,8 +1552,8 @@ func (s *Service) InitFields(job string, taskGroup string, task string) {
 	}
 }
 
-func (s *Service) ID(allocID string, taskName string) string {
-	return fmt.Sprintf("%s-%s-%s-%s", NomadConsulPrefix, allocID, taskName, s.Hash())
+func (s *Service) ID(identifier string) string {
+	return fmt.Sprintf("%s-%s-%s", NomadConsulPrefix, identifier, s.Hash())
 }
 
 // Validate checks if the Check definition is valid
@@ -1772,16 +1805,31 @@ func (t *Task) Validate() error {
 func validateServices(t *Task) error {
 	var mErr multierror.Error
 
-	// Ensure that services don't ask for non-existent ports.
+	// Ensure that services don't ask for non-existent ports and their names are
+	// unique.
 	servicePorts := make(map[string][]string)
+	knownServices := make(map[string]struct{})
 	for i, service := range t.Services {
 		if err := service.Validate(); err != nil {
 			outer := fmt.Errorf("service %d validation failed: %s", i, err)
 			mErr.Errors = append(mErr.Errors, outer)
 		}
+		if _, ok := knownServices[service.Name]; ok {
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("service %q is duplicate", service.Name))
+		}
+		knownServices[service.Name] = struct{}{}
 
 		if service.PortLabel != "" {
 			servicePorts[service.PortLabel] = append(servicePorts[service.PortLabel], service.Name)
+		}
+
+		// Ensure that check names are unique.
+		knownChecks := make(map[string]struct{})
+		for _, check := range service.Checks {
+			if _, ok := knownChecks[check.Name]; ok {
+				mErr.Errors = append(mErr.Errors, fmt.Errorf("check %q is duplicate", check.Name))
+			}
+			knownChecks[check.Name] = struct{}{}
 		}
 	}
 
@@ -1816,12 +1864,12 @@ const (
 )
 
 // TaskState tracks the current state of a task and events that caused state
-// transistions.
+// transitions.
 type TaskState struct {
 	// The current state of the task.
 	State string
 
-	// Series of task events that transistion the state of the task.
+	// Series of task events that transition the state of the task.
 	Events []*TaskEvent
 }
 
@@ -1905,7 +1953,7 @@ type TaskEvent struct {
 	RestartReason string
 
 	// Driver Failure fields.
-	DriverError string // A driver error occured while starting the task.
+	DriverError string // A driver error occurred while starting the task.
 
 	// Task Terminated Fields.
 	ExitCode int    // The exit code of the task.
@@ -2569,13 +2617,17 @@ type Evaluation struct {
 	// This is used to support rolling upgrades, where we need a chain of evaluations.
 	PreviousEval string
 
-	// ClassEligibility tracks computed node classes that have been explicitely
+	// ClassEligibility tracks computed node classes that have been explicitly
 	// marked as eligible or ineligible.
 	ClassEligibility map[string]bool
 
 	// EscapedComputedClass marks whether the job has constraints that are not
 	// captured by computed node classes.
 	EscapedComputedClass bool
+
+	// AnnotatePlan triggers the scheduler to provide additional annotations
+	// during the evaluation. This should not be set during normal operations.
+	AnnotatePlan bool
 
 	// Raft Indexes
 	CreateIndex uint64
@@ -2664,7 +2716,7 @@ func (e *Evaluation) NextRollingEval(wait time.Duration) *Evaluation {
 }
 
 // BlockedEval creates a blocked evaluation to followup this eval to place any
-// failed allocations. It takes the classes marked explicitely eligible or
+// failed allocations. It takes the classes marked explicitly eligible or
 // ineligible and whether the job has escaped computed node classes.
 func (e *Evaluation) BlockedEval(classEligibility map[string]bool, escaped bool) *Evaluation {
 	return &Evaluation{
@@ -2721,6 +2773,10 @@ type Plan struct {
 	// but are persisted so that the user can use the feedback
 	// to determine the cause.
 	FailedAllocs []*Allocation
+
+	// Annotations contains annotations by the scheduler to be used by operators
+	// to understand the decisions made by the scheduler.
+	Annotations *PlanAnnotations
 }
 
 func (p *Plan) AppendUpdate(alloc *Allocation, status, desc string) {
@@ -2815,6 +2871,24 @@ func (p *PlanResult) FullCommit(plan *Plan) (bool, int, int) {
 		actual += len(didAlloc)
 	}
 	return actual == expected, expected, actual
+}
+
+// PlanAnnotations holds annotations made by the scheduler to give further debug
+// information to operators.
+type PlanAnnotations struct {
+	// DesiredTGUpdates is the set of desired updates per task group.
+	DesiredTGUpdates map[string]*DesiredUpdates
+}
+
+// DesiredUpdates is the set of changes the scheduler would like to make given
+// sufficient resources and cluster capacity.
+type DesiredUpdates struct {
+	Ignore            uint64
+	Place             uint64
+	Migrate           uint64
+	Stop              uint64
+	InPlaceUpdate     uint64
+	DestructiveUpdate uint64
 }
 
 // msgpackHandle is a shared handle for encoding/decoding of structs

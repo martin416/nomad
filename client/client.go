@@ -582,6 +582,7 @@ func (c *Client) reservePorts() {
 func (c *Client) fingerprint() error {
 	whitelist := c.config.ReadStringListToMap("fingerprint.whitelist")
 	whitelistEnabled := len(whitelist) > 0
+	c.logger.Printf("[DEBUG] client: built-in fingerprints: %v", fingerprint.BuiltinFingerprints)
 
 	var applied []string
 	var skipped []string
@@ -1172,15 +1173,7 @@ func (c *Client) addAlloc(alloc *structs.Allocation) error {
 
 // setupConsulClient creates a ConsulService
 func (c *Client) setupConsulClient() error {
-	cfg := consul.ConsulConfig{
-		Addr:      c.config.ReadDefault("consul.address", "127.0.0.1:8500"),
-		Token:     c.config.Read("consul.token"),
-		Auth:      c.config.Read("consul.auth"),
-		EnableSSL: c.config.ReadBoolDefault("consul.ssl", false),
-		VerifySSL: c.config.ReadBoolDefault("consul.verifyssl", true),
-	}
-
-	cs, err := consul.NewConsulService(&cfg, c.logger, "")
+	cs, err := consul.NewConsulService(c.config.ConsulConfig, c.logger)
 	c.consulService = cs
 	return err
 }
@@ -1215,12 +1208,14 @@ func (c *Client) syncConsul() {
 					if taskState.State == structs.TaskStateRunning {
 						if tr, ok := ar.tasks[taskName]; ok {
 							for _, service := range tr.task.Services {
-								services[service.ID(ar.alloc.ID, tr.task.Name)] = struct{}{}
+								svcIdentifier := fmt.Sprintf("%s-%s", ar.alloc.ID, tr.task.Name)
+								services[service.ID(svcIdentifier)] = struct{}{}
 							}
 						}
 					}
 				}
 			}
+
 			if err := c.consulService.KeepServices(services); err != nil {
 				c.logger.Printf("[DEBUG] client: error removing services from non-running tasks: %v", err)
 			}

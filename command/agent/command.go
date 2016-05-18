@@ -58,10 +58,11 @@ func (c *Command) readConfig() *Config {
 
 	// Make a new, empty config.
 	cmdConfig := &Config{
-		Atlas:  &AtlasConfig{},
-		Client: &ClientConfig{},
-		Ports:  &Ports{},
-		Server: &ServerConfig{},
+		Atlas:        &AtlasConfig{},
+		ConsulConfig: &ConsulConfig{},
+		Client:       &ClientConfig{},
+		Ports:        &Ports{},
+		Server:       &ServerConfig{},
 	}
 
 	flags := flag.NewFlagSet("agent", flag.ContinueOnError)
@@ -339,7 +340,12 @@ func (c *Command) checkpointResults(results *checkpoint.CheckResponse, err error
 		return
 	}
 	if results.Outdated {
-		c.Ui.Error(fmt.Sprintf("Newer Nomad version available: %s", results.CurrentVersion))
+		versionStr := c.Version
+		if c.VersionPrerelease != "" {
+			versionStr += fmt.Sprintf("-%s", c.VersionPrerelease)
+		}
+
+		c.Ui.Error(fmt.Sprintf("Newer Nomad version available: %s (currently running: %s)", results.CurrentVersion, versionStr))
 	}
 	for _, alert := range results.Alerts {
 		switch alert.Level {

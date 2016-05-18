@@ -1,3 +1,14 @@
+## 0.4.0 (UNRELEASED)
+
+IMPROVEMENTS:
+  * api: Plan api introduced for the Job endpoint [GH-1168]
+  * cli: Unify the `fs` family of commands to be a single command [GH-1150]
+
+BUG FIXES:
+  * core: Updated User, Meta or Resources in a task cause create/destroy updates
+    [GH-1128, GH-1153]
+  * discovery: Ensure service and check names are unique [GH-1143, GH-1144]
+
 ## 0.3.2 (April 22, 2016)
 
 IMPROVEMENTS:

@@ -241,47 +241,43 @@ The `Job` object supports the following keys:
 
 ### Task Group
 
-`TaskGroups` is a list of `Task Group`, and each object supports the following
+`TaskGroups` is a list of `TaskGroup` objects, each supports the following
 attributes:
+
+* `Constraints` - This is a list of `Constraint` objects. See the constraint
+  reference for more details.
 
 * `Count` - Specifies the number of the task groups that should
   be running. Must be non-negative, defaults to one.
 
-* `Constraints` - This is a list of `Constraint` objects. See the constraint
-  reference for more details.
+* `Meta` - A key/value map that annotates the task group with opaque metadata.
+
+* `Name` - The name of the task group. Must be specified.
 
 * `RestartPolicy` - Specifies the restart policy to be applied to tasks in this group.
   If omitted, a default policy for batch and non-batch jobs is used based on the
   job type. See the restart policy reference for more details.
 
-* `Tasks` - It's a list of `Task` object, allows adding tasks as
-  part of the group.
-
-* `Meta` - A key/value map that annotates the task group with opaque metadata.
+* `Tasks` - A list of `Task` object that are part of the task group.
 
 ### Task
 
 The `Task` object supports the following keys:
 
-* `Driver` - Specifies the task driver that should be used to run the
-  task. See the [driver documentation](/docs/drivers/index.html) for what
-  is available. Examples include `docker`, `qemu`, `java`, and `exec`.
-
-* `User` - Set the user that will run the task. It defaults to the same user
-  the Nomad client is being run as.
-
-* `Constraints` - This is a list of `Constraint` objects. See the constraint
+* `Artifacts` - `Artifacts` is a list of `Artifact` objects which define
+  artifacts to be downloaded before the task is run. See the artifacts
   reference for more details.
 
 * `Config` - A map of key/value configuration passed into the driver
   to start the task. The details of configurations are specific to
   each driver.
 
-* `Services` - Nomad integrates with Consul for service discovery. A service
-  block represents a routable and discoverable service on the network. Nomad
-  automatically registers when a task is started and de-registers it when the
-  task transitions to the dead state. [Click
-  here](/docs/jobspec/servicediscovery.html) to learn more about services.
+* `Constraints` - This is a list of `Constraint` objects. See the constraint
+  reference for more details.
+
+* `Driver` - Specifies the task driver that should be used to run the
+  task. See the [driver documentation](/docs/drivers/index.html) for what
+  is available. Examples include `docker`, `qemu`, `java`, and `exec`.
 
 *   `Env` - A map of key/value representing environment variables that
     will be passed along to the running process. Nomad variables are
@@ -296,11 +292,6 @@ The `Task` object supports the following keys:
         }
     ```
 
-* `Resources` - Provides the resource requirements of the task.
-  See the resources reference for more details.
-
-* `Meta` - Annotates the task group with opaque metadata.
-
 * `KillTimeout` - `KillTimeout` is a time duration in nanoseconds. It can be
   used to configure the time between signaling a task it will be killed and
   actually killing it. Drivers first sends a task the `SIGINT` signal and then
@@ -310,9 +301,76 @@ The `Task` object supports the following keys:
 * `LogConfig` - This allows configuring log rotation for the `stdout` and `stderr`
   buffers of a Task. See the log rotation reference below for more details.
 
-* `Artifacts` - `Artifacts` is a list of `Artifact` objects which define
-  artifacts to be downloaded before the task is run. See the artifacts
-  reference for more details.
+* `Meta` - Annotates the task group with opaque metadata.
+
+* `Name` - The name of the task. This field is required.
+
+* `Resources` - Provides the resource requirements of the task.
+  See the resources reference for more details.
+
+* `Services` - `Services` is a list of `Service` objects. Nomad integrates with
+  Consul for service discovery. A `Service` object represents a routable and
+  discoverable service on the network. Nomad automatically registers when a task
+  is started and de-registers it when the task transitions to the dead state.
+  [Click here](/docs/jobspec/servicediscovery.html) to learn more about
+  services. Below is the fields in the `Service` object:
+
+     * `Name`: Nomad automatically determines the name of a Task. By default the
+       name of a service is `$(job-name)-$(task-group)-$(task-name)`. Users can
+       explicitly name the service by specifying this option. If multiple
+       services are defined for a Task then only one task can have the default
+       name, all the services have to be explicitly named.  Users can add the
+       following to the service names: `${JOB}`, `${TASKGROUP}`, `${TASK}`,
+       `${BASE}`.  Nomad will replace them with the appropriate value of the
+       Job, Task Group, and Task names while registering the Job. `${BASE}`
+       expands to `${JOB}-${TASKGROUP}-${TASK}`.  Names must be adhere to
+       [RFC-1123 §2.1](https://tools.ietf.org/html/rfc1123#section-2) and are
+       limited to alphanumeric and hyphen characters (i.e. `[a-z0-9\-]`), and be
+       less than 64 characters in length.
+
+     * `Tags`: A list of string tags associated with this Service. String
+       interpolation is supported in tags.
+
+     * `PortLabel`: `PortLabel` is an optional string and is used to associate
+       the port with the service.  If specified, the port label must match one
+       defined in the resources block.  This could be a label to either a
+       dynamic or a static port. If an incorrect port label is specified, Nomad
+       doesn't register the IP:Port with Consul.
+
+     * `Checks`: `Checks` is an array of check objects. A check object defines a
+       health check associated with the service. Nomad supports the `script`,
+       `http` and `tcp` Consul Checks. Script checks are not supported for the
+       qemu driver since the Nomad client doesn't have access to the file system
+       of a tasks using the Qemu driver.
+
+         * `Type`:  This indicates the check types supported by Nomad. Valid
+           options are currently `script`, `http` and `tcp`.
+
+         * `Name`: The name of the health check.
+
+         * `Interval`: This indicates the frequency of the health checks that
+           Consul will perform.
+
+         * `Timeout`: This indicates how long Consul will wait for a health
+           check query to succeed.
+
+         * `Path`:The path of the http endpoint which Consul will query to query
+           the health of a service if the type of the check is `http`. Nomad
+           will add the IP of the service and the port, users are only required
+           to add the relative URL of the health check endpoint.
+
+         * `Protocol`: This indicates the protocol for the http checks. Valid
+           options are `http` and `https`. We default it to `http`
+
+         * `Command`: This is the command that the Nomad client runs for doing
+           script based health check.
+
+         * `Args`: Additional arguments to the `command` for script based health
+           checks.
+
+
+* `User` - Set the user that will run the task. It defaults to the same user
+  the Nomad client is being run as.
 
 ### Resources
 
@@ -332,9 +390,9 @@ The Network object supports the following keys:
 
 * `MBits` - The number of MBits in bandwidth required.
 
-Nomad can allocate two types of ports to a task - Dynamic and Static ports. A
-network object allows the user to specify a list of `DynamicPorts` and
-`StaticPorts`. Each object supports the following attributes:
+Nomad can allocate two types of ports to a task - Dynamic and Static/Reserved
+ports. A network object allows the user to specify a list of `DynamicPorts` and
+`ReservedPorts`. Each object supports the following attributes:
 
 * `Value` - The port number for static ports. If the port is dynamic, then this
   attribute is ignored.
@@ -401,7 +459,7 @@ The `LogConfig` object configures the log rotation policy for a task's `stdout` 
 * `MaxFiles` - The maximum number of rotated files Nomad will retain for
   `stdout` and `stderr`, each tracked individually.
 
-* `MaxFileSize` - The size of each rotated file. The size is specified in
+* `MaxFileSizeMB` - The size of each rotated file. The size is specified in
   `MB`.
 
 If the amount of disk resource requested for the task is less than the total
@@ -459,13 +517,15 @@ The `Artifact` object supports the following keys:
 An example of downloading and unzipping an archive is as simple as:
 
 ```
-"Artifacts": {
-  # The archive will be extracted before the task is run, making
-  # it easy to ship configurations with your binary.
-  "GetterSource": "https://example.com/my.zip",
+"Artifacts": [
+  {
+    # The archive will be extracted before the task is run, making
+    # it easy to ship configurations with your binary.
+    "GetterSource": "https://example.com/my.zip",
 
-  "GetterOptions": {
-    "checksum": "md5:7f4b3e3b4dd5150d4e5aaaa5efada4c3"
+    "GetterOptions": {
+      "checksum": "md5:7f4b3e3b4dd5150d4e5aaaa5efada4c3"
+    }
   }
-}
+]
 ```

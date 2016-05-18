@@ -12,6 +12,13 @@ import (
 	"github.com/hashicorp/nomad/nomad/structs"
 )
 
+// noErr is used to assert there are no errors
+func noErr(t *testing.T, err error) {
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+}
+
 func TestMaterializeTaskGroups(t *testing.T) {
 	job := mock.Job()
 	index := materializeTaskGroups(job)
@@ -376,6 +383,52 @@ func TestTasksUpdated(t *testing.T) {
 	if !tasksUpdated(j1.TaskGroups[0], j7.TaskGroups[0]) {
 		t.Fatalf("bad")
 	}
+
+	j8 := mock.Job()
+	j8.TaskGroups[0].Tasks[0].User = "foo"
+	if !tasksUpdated(j1.TaskGroups[0], j8.TaskGroups[0]) {
+		t.Fatalf("bad")
+	}
+
+	j9 := mock.Job()
+	j9.TaskGroups[0].Tasks[0].Artifacts = []*structs.TaskArtifact{
+		{
+			GetterSource: "http://foo.com/bar",
+		},
+	}
+	if !tasksUpdated(j1.TaskGroups[0], j9.TaskGroups[0]) {
+		t.Fatalf("bad")
+	}
+
+	j10 := mock.Job()
+	j10.TaskGroups[0].Tasks[0].Meta["baz"] = "boom"
+	if !tasksUpdated(j1.TaskGroups[0], j10.TaskGroups[0]) {
+		t.Fatalf("bad")
+	}
+
+	j11 := mock.Job()
+	j11.TaskGroups[0].Tasks[0].Resources.CPU = 1337
+	if !tasksUpdated(j1.TaskGroups[0], j11.TaskGroups[0]) {
+		t.Fatalf("bad")
+	}
+
+	j12 := mock.Job()
+	j12.TaskGroups[0].Tasks[0].Resources.Networks[0].MBits = 100
+	if !tasksUpdated(j1.TaskGroups[0], j12.TaskGroups[0]) {
+		t.Fatalf("bad")
+	}
+
+	j13 := mock.Job()
+	j13.TaskGroups[0].Tasks[0].Resources.Networks[0].DynamicPorts[0].Label = "foobar"
+	if !tasksUpdated(j1.TaskGroups[0], j13.TaskGroups[0]) {
+		t.Fatalf("bad")
+	}
+
+	j14 := mock.Job()
+	j14.TaskGroups[0].Tasks[0].Resources.Networks[0].ReservedPorts = []structs.Port{{Label: "foo", Value: 1312}}
+	if !tasksUpdated(j1.TaskGroups[0], j14.TaskGroups[0]) {
+		t.Fatalf("bad")
+	}
 }
 
 func TestEvictAndPlace_LimitLessThanAllocs(t *testing.T) {
@@ -496,9 +549,9 @@ func TestInplaceUpdate_ChangedTaskGroup(t *testing.T) {
 	stack := NewGenericStack(false, ctx)
 
 	// Do the inplace update.
-	unplaced := inplaceUpdate(ctx, eval, job, stack, updates)
+	unplaced, inplace := inplaceUpdate(ctx, eval, job, stack, updates)
 
-	if len(unplaced) != 1 {
+	if len(unplaced) != 1 || len(inplace) != 0 {
 		t.Fatal("inplaceUpdate incorrectly did an inplace update")
 	}
 
@@ -541,9 +594,9 @@ func TestInplaceUpdate_NoMatch(t *testing.T) {
 	stack := NewGenericStack(false, ctx)
 
 	// Do the inplace update.
-	unplaced := inplaceUpdate(ctx, eval, job, stack, updates)
+	unplaced, inplace := inplaceUpdate(ctx, eval, job, stack, updates)
 
-	if len(unplaced) != 1 {
+	if len(unplaced) != 1 || len(inplace) != 0 {
 		t.Fatal("inplaceUpdate incorrectly did an inplace update")
 	}
 
@@ -612,14 +665,18 @@ func TestInplaceUpdate_Success(t *testing.T) {
 	stack.SetJob(job)
 
 	// Do the inplace update.
-	unplaced := inplaceUpdate(ctx, eval, job, stack, updates)
+	unplaced, inplace := inplaceUpdate(ctx, eval, job, stack, updates)
 
-	if len(unplaced) != 0 {
+	if len(unplaced) != 0 || len(inplace) != 1 {
 		t.Fatal("inplaceUpdate did not do an inplace update")
 	}
 
 	if len(ctx.plan.NodeAllocation) != 1 {
 		t.Fatal("inplaceUpdate did not do an inplace update")
+	}
+
+	if inplace[0].Alloc.ID != alloc.ID {
+		t.Fatalf("inplaceUpdate returned the wrong, inplace updated alloc: %#v", inplace)
 	}
 
 	// Get the alloc we inserted.
@@ -731,5 +788,63 @@ func TestProgressMade(t *testing.T) {
 	alloc := &structs.PlanResult{NodeAllocation: m}
 	if !(progressMade(both) && progressMade(update) && progressMade(alloc)) {
 		t.Fatal("bad")
+	}
+}
+
+func TestDesiredUpdates(t *testing.T) {
+	tg1 := &structs.TaskGroup{Name: "foo"}
+	tg2 := &structs.TaskGroup{Name: "bar"}
+	a2 := &structs.Allocation{TaskGroup: "bar"}
+
+	place := []allocTuple{
+		allocTuple{TaskGroup: tg1},
+		allocTuple{TaskGroup: tg1},
+		allocTuple{TaskGroup: tg1},
+		allocTuple{TaskGroup: tg2},
+	}
+	stop := []allocTuple{
+		allocTuple{TaskGroup: tg2, Alloc: a2},
+		allocTuple{TaskGroup: tg2, Alloc: a2},
+	}
+	ignore := []allocTuple{
+		allocTuple{TaskGroup: tg1},
+	}
+	migrate := []allocTuple{
+		allocTuple{TaskGroup: tg2},
+	}
+	inplace := []allocTuple{
+		allocTuple{TaskGroup: tg1},
+		allocTuple{TaskGroup: tg1},
+	}
+	destructive := []allocTuple{
+		allocTuple{TaskGroup: tg1},
+		allocTuple{TaskGroup: tg2},
+		allocTuple{TaskGroup: tg2},
+	}
+	diff := &diffResult{
+		place:   place,
+		stop:    stop,
+		ignore:  ignore,
+		migrate: migrate,
+	}
+
+	expected := map[string]*structs.DesiredUpdates{
+		"foo": {
+			Place:             3,
+			Ignore:            1,
+			InPlaceUpdate:     2,
+			DestructiveUpdate: 1,
+		},
+		"bar": {
+			Place:             1,
+			Stop:              2,
+			Migrate:           1,
+			DestructiveUpdate: 2,
+		},
+	}
+
+	desired := desiredUpdates(diff, inplace, destructive)
+	if !reflect.DeepEqual(desired, expected) {
+		t.Fatalf("desiredUpdates() returned %#v; want %#v", desired, expected)
 	}
 }

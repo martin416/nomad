@@ -19,7 +19,7 @@ the Nomad agent.
 When specifying multiple config file options on the command-line, the files are
 loaded in the order they are specified. For example:
 
-    nomad agent -config server.conf /etc/nomad extra.json
+    nomad agent -config server.conf -config /etc/nomad -config extra.json
 
 Will load configuration from `server.conf`, from `.hcl` and `.json` files under
 `/etc/nomad`, and finally from `extra.json`.
@@ -324,9 +324,9 @@ configured on server nodes.
     * `cpu`: `cpu` is given as MHz to reserve.
     * `memory`: `memory` is given as MB to reserve.
     * `disk`: `disk` is given as MB to reserve.
-    * `reserved_ports`: `reserved_ports` is a comma seperated list of ports
+    * `reserved_ports`: `reserved_ports` is a comma separated list of ports
       to reserve on all fingerprinted network devices. Ranges can be
-      specified by using a hyphen seperated the two inclusive ends.
+      specified by using a hyphen separated the two inclusive ends.
 
 ### Client Options Map <a id="options_map"></a>
 
@@ -358,9 +358,9 @@ documentation [here](/docs/drivers/index.html)
   applicable.
 
 *   `env.blacklist`: Nomad passes the host environment variables to `exec`,
-    `raw_exec` and `java` tasks. `env.blacklist` is a comma seperated list of
+    `raw_exec` and `java` tasks. `env.blacklist` is a comma separated list of
     environment variable keys not to pass to these tasks. If specified, the
-    defaults are overriden. The following are the default:
+    defaults are overridden. The following are the default:
     
     * `CONSUL_TOKEN`
     * `VAULT_TOKEN`

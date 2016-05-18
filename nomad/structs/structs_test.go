@@ -276,7 +276,7 @@ func TestTask_Validate(t *testing.T) {
 }
 
 func TestTask_Validate_Services(t *testing.T) {
-	s := &Service{
+	s1 := &Service{
 		Name:      "service-name",
 		PortLabel: "bar",
 		Checks: []*ServiceCheck{
@@ -284,7 +284,15 @@ func TestTask_Validate_Services(t *testing.T) {
 				Name: "check-name",
 				Type: ServiceCheckTCP,
 			},
+			{
+				Name: "check-name",
+				Type: ServiceCheckTCP,
+			},
 		},
+	}
+
+	s2 := &Service{
+		Name: "service-name",
 	}
 
 	task := &Task{
@@ -296,7 +304,7 @@ func TestTask_Validate_Services(t *testing.T) {
 			MemoryMB: 100,
 			IOPS:     10,
 		},
-		Services: []*Service{s},
+		Services: []*Service{s1, s2},
 	}
 	err := task.Validate()
 	if err == nil {
@@ -304,6 +312,14 @@ func TestTask_Validate_Services(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "referenced by services service-name does not exist") {
 		t.Fatalf("err: %s", err)
+	}
+
+	if !strings.Contains(err.Error(), "service \"service-name\" is duplicate") {
+		t.Fatalf("err: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), "check \"check-name\" is duplicate") {
+		t.Fatalf("err: %v", err)
 	}
 }
 

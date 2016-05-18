@@ -293,10 +293,16 @@ func tasksUpdated(a, b *structs.TaskGroup) bool {
 		if at.Driver != bt.Driver {
 			return true
 		}
+		if at.User != bt.User {
+			return true
+		}
 		if !reflect.DeepEqual(at.Config, bt.Config) {
 			return true
 		}
 		if !reflect.DeepEqual(at.Env, bt.Env) {
+			return true
+		}
+		if !reflect.DeepEqual(at.Meta, bt.Meta) {
 			return true
 		}
 		if !reflect.DeepEqual(at.Artifacts, bt.Artifacts) {
@@ -310,12 +316,43 @@ func tasksUpdated(a, b *structs.TaskGroup) bool {
 		for idx := range at.Resources.Networks {
 			an := at.Resources.Networks[idx]
 			bn := bt.Resources.Networks[idx]
-			if len(an.DynamicPorts) != len(bn.DynamicPorts) {
+
+			if an.MBits != bn.MBits {
+				return true
+			}
+
+			aPorts, bPorts := networkPortMap(an), networkPortMap(bn)
+			if !reflect.DeepEqual(aPorts, bPorts) {
 				return true
 			}
 		}
+
+		// Inspect the non-network resources
+		if ar, br := at.Resources, bt.Resources; ar.CPU != br.CPU {
+			return true
+		} else if ar.MemoryMB != br.MemoryMB {
+			return true
+		} else if ar.DiskMB != br.DiskMB {
+			return true
+		} else if ar.IOPS != br.IOPS {
+			return true
+		}
 	}
 	return false
+}
+
+// networkPortMap takes a network resource and returns a map of port labels to
+// values. The value for dynamic ports is disregarded even if it is set. This
+// makes this function suitable for comparing two network resources for changes.
+func networkPortMap(n *structs.NetworkResource) map[string]int {
+	m := make(map[string]int, len(n.DynamicPorts)+len(n.ReservedPorts))
+	for _, p := range n.ReservedPorts {
+		m[p.Label] = p.Value
+	}
+	for _, p := range n.DynamicPorts {
+		m[p.Label] = -1
+	}
+	return m
 }
 
 // setStatus is used to update the status of the evaluation
@@ -330,12 +367,13 @@ func setStatus(logger *log.Logger, planner Planner, eval, nextEval *structs.Eval
 	return planner.UpdateEval(newEval)
 }
 
-// inplaceUpdate attempts to update allocations in-place where possible.
+// inplaceUpdate attempts to update allocations in-place where possible. It
+// returns the allocs that couldn't be done inplace and then those that could.
 func inplaceUpdate(ctx Context, eval *structs.Evaluation, job *structs.Job,
-	stack Stack, updates []allocTuple) []allocTuple {
+	stack Stack, updates []allocTuple) (destructive, inplace []allocTuple) {
 
 	n := len(updates)
-	inplace := 0
+	inplaceCount := 0
 	for i := 0; i < n; i++ {
 		// Get the update
 		update := updates[i]
@@ -404,15 +442,15 @@ func inplaceUpdate(ctx Context, eval *structs.Evaluation, job *structs.Job,
 		ctx.Plan().AppendAlloc(newAlloc)
 
 		// Remove this allocation from the slice
-		updates[i] = updates[n-1]
+		updates[i], updates[n-1] = updates[n-1], updates[i]
 		i--
 		n--
-		inplace++
+		inplaceCount++
 	}
 	if len(updates) > 0 {
-		ctx.Logger().Printf("[DEBUG] sched: %#v: %d in-place updates of %d", eval, inplace, len(updates))
+		ctx.Logger().Printf("[DEBUG] sched: %#v: %d in-place updates of %d", eval, inplaceCount, len(updates))
 	}
-	return updates[:n]
+	return updates[:n], updates[n:]
 }
 
 // evictAndPlace is used to mark allocations for evicts and add them to the
@@ -462,4 +500,80 @@ func taskGroupConstraints(tg *structs.TaskGroup) tgConstrainTuple {
 	}
 
 	return c
+}
+
+// desiredUpdates takes the diffResult as well as the set of inplace and
+// destructive updates and returns a map of task groups to their set of desired
+// updates.
+func desiredUpdates(diff *diffResult, inplaceUpdates,
+	destructiveUpdates []allocTuple) map[string]*structs.DesiredUpdates {
+	desiredTgs := make(map[string]*structs.DesiredUpdates)
+
+	for _, tuple := range diff.place {
+		name := tuple.TaskGroup.Name
+		des, ok := desiredTgs[name]
+		if !ok {
+			des = &structs.DesiredUpdates{}
+			desiredTgs[name] = des
+		}
+
+		des.Place++
+	}
+
+	for _, tuple := range diff.stop {
+		name := tuple.Alloc.TaskGroup
+		des, ok := desiredTgs[name]
+		if !ok {
+			des = &structs.DesiredUpdates{}
+			desiredTgs[name] = des
+		}
+
+		des.Stop++
+	}
+
+	for _, tuple := range diff.ignore {
+		name := tuple.TaskGroup.Name
+		des, ok := desiredTgs[name]
+		if !ok {
+			des = &structs.DesiredUpdates{}
+			desiredTgs[name] = des
+		}
+
+		des.Ignore++
+	}
+
+	for _, tuple := range diff.migrate {
+		name := tuple.TaskGroup.Name
+		des, ok := desiredTgs[name]
+		if !ok {
+			des = &structs.DesiredUpdates{}
+			desiredTgs[name] = des
+		}
+
+		des.Migrate++
+	}
+
+	for _, tuple := range inplaceUpdates {
+		name := tuple.TaskGroup.Name
+		des, ok := desiredTgs[name]
+		if !ok {
+			des = &structs.DesiredUpdates{}
+			desiredTgs[name] = des
+		}
+
+		des.InPlaceUpdate++
+	}
+
+	for _, tuple := range destructiveUpdates {
+		name := tuple.TaskGroup.Name
+		des, ok := desiredTgs[name]
+		if !ok {
+			des = &structs.DesiredUpdates{}
+			desiredTgs[name] = des
+		}
+
+		des.DestructiveUpdate++
+	}
+
+	return desiredTgs
 }

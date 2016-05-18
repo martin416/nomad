@@ -317,7 +317,7 @@ func (e *UniversalExecutor) UpdateTask(task *structs.Task) error {
 
 	// Re-syncing task with consul service
 	if e.consulService != nil {
-		if err := e.consulService.SyncTask(task); err != nil {
+		if err := e.consulService.SyncServices(task.Services); err != nil {
 			return err
 		}
 	}
@@ -338,8 +338,16 @@ func (e *UniversalExecutor) wait() {
 		if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
 			exitCode = status.ExitStatus()
 			if status.Signaled() {
+				// bash(1) uses the lower 7 bits of a uint8
+				// to indicate normal program failure (see
+				// <sysexits.h>). If a process terminates due
+				// to a signal, encode the signal number to
+				// indicate which signal caused the process
+				// to terminate.  Mirror this exit code
+				// encoding scheme.
+				const exitSignalBase = 128
 				signal = int(status.Signal())
-				exitCode = 128 + signal
+				exitCode = exitSignalBase + signal
 			}
 		}
 	} else {
@@ -423,17 +431,19 @@ func (e *UniversalExecutor) SyncServices(ctx *ConsulContext) error {
 	e.logger.Printf("[INFO] executor: registering services")
 	e.consulCtx = ctx
 	if e.consulService == nil {
-		cs, err := consul.NewConsulService(ctx.ConsulConfig, e.logger, e.ctx.AllocID)
+		cs, err := consul.NewConsulService(ctx.ConsulConfig, e.logger)
 		if err != nil {
 			return err
 		}
 		cs.SetDelegatedChecks(e.createCheckMap(), e.createCheck)
+		cs.SetServiceIdentifier(consul.GenerateServiceIdentifier(e.ctx.AllocID, e.ctx.Task.Name))
+		cs.SetAddrFinder(e.ctx.Task.FindHostAndPortFor)
 		e.consulService = cs
 	}
 	if e.ctx != nil {
 		e.interpolateServices(e.ctx.Task)
 	}
-	err := e.consulService.SyncTask(e.ctx.Task)
+	err := e.consulService.SyncServices(e.ctx.Task.Services)
 	go e.consulService.PeriodicSync()
 	return err
 }
@@ -566,6 +576,7 @@ func (e *UniversalExecutor) createCheck(check *structs.ServiceCheck, checkID str
 		return &DockerScriptCheck{
 			id:          checkID,
 			interval:    check.Interval,
+			timeout:     check.Timeout,
 			containerID: e.consulCtx.ContainerID,
 			logger:      e.logger,
 			cmd:         check.Command,
@@ -573,10 +584,12 @@ func (e *UniversalExecutor) createCheck(check *structs.ServiceCheck, checkID str
 		}, nil
 	}
 
-	if check.Type == structs.ServiceCheckScript && e.ctx.Driver == "exec" {
+	if check.Type == structs.ServiceCheckScript && (e.ctx.Driver == "exec" ||
+		e.ctx.Driver == "raw_exec" || e.ctx.Driver == "java") {
 		return &ExecScriptCheck{
 			id:          checkID,
 			interval:    check.Interval,
+			timeout:     check.Timeout,
 			cmd:         check.Command,
 			args:        check.Args,
 			taskDir:     e.taskDir,
