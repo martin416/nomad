@@ -59,6 +59,11 @@ type Worker struct {
 	failures uint
 
 	evalToken string
+
+	// snapshotIndex is the index of the snapshot in which the scheduler was
+	// first envoked. It is used to mark the SnapshotIndex of evaluations
+	// Created, Updated or Reblocked.
+	snapshotIndex uint64
 }
 
 // NewWorker starts a new worker associated with the given server
@@ -207,12 +212,21 @@ func (w *Worker) sendAck(evalID, token string, ack bool) {
 // state (attempt to allocate to a failed/dead node), we may need
 // to sync our state again and do the planning with more recent data.
 func (w *Worker) waitForIndex(index uint64, timeout time.Duration) error {
+	// XXX: Potential optimization is to set up a watch on the state stores
+	// index table and only unblock via a trigger rather than timing out and
+	// checking.
+
 	start := time.Now()
 	defer metrics.MeasureSince([]string{"nomad", "worker", "wait_for_index"}, start)
 CHECK:
+	// Get the states current index
+	snapshotIndex, err := w.srv.fsm.State().LatestIndex()
+	if err != nil {
+		return fmt.Errorf("failed to determine state store's index: %v", err)
+	}
+
 	// We only need the FSM state to be as recent as the given index
-	appliedIndex := w.srv.raft.AppliedIndex()
-	if index <= appliedIndex {
+	if index <= snapshotIndex {
 		w.backoffReset()
 		return nil
 	}
@@ -239,6 +253,12 @@ func (w *Worker) invokeScheduler(eval *structs.Evaluation, token string) error {
 	snap, err := w.srv.fsm.State().Snapshot()
 	if err != nil {
 		return fmt.Errorf("failed to snapshot state: %v", err)
+	}
+
+	// Store the snapshot's index
+	w.snapshotIndex, err = snap.LatestIndex()
+	if err != nil {
+		return fmt.Errorf("failed to determine snapshot's index: %v", err)
 	}
 
 	// Create the scheduler, or use the special system scheduler
@@ -308,7 +328,7 @@ SUBMIT:
 	var state scheduler.State
 	if result.RefreshIndex != 0 {
 		// Wait for the the raft log to catchup to the evaluation
-		w.logger.Printf("[DEBUG] worker: refreshing state to index %d", result.RefreshIndex)
+		w.logger.Printf("[DEBUG] worker: refreshing state to index %d for %q", result.RefreshIndex, plan.EvalID)
 		if err := w.waitForIndex(result.RefreshIndex, raftSyncLimit); err != nil {
 			return nil, nil, err
 		}
@@ -333,6 +353,9 @@ func (w *Worker) UpdateEval(eval *structs.Evaluation) error {
 		return fmt.Errorf("shutdown while planning")
 	}
 	defer metrics.MeasureSince([]string{"nomad", "worker", "update_eval"}, time.Now())
+
+	// Store the snapshot index in the eval
+	eval.SnapshotIndex = w.snapshotIndex
 
 	// Setup the request
 	req := structs.EvalUpdateRequest{
@@ -369,6 +392,9 @@ func (w *Worker) CreateEval(eval *structs.Evaluation) error {
 	}
 	defer metrics.MeasureSince([]string{"nomad", "worker", "create_eval"}, time.Now())
 
+	// Store the snapshot index in the eval
+	eval.SnapshotIndex = w.snapshotIndex
+
 	// Setup the request
 	req := structs.EvalUpdateRequest{
 		Evals:     []*structs.Evaluation{eval},
@@ -390,6 +416,44 @@ SUBMIT:
 		return err
 	} else {
 		w.logger.Printf("[DEBUG] worker: created evaluation %#v", eval)
+		w.backoffReset()
+	}
+	return nil
+}
+
+// ReblockEval is used to reinsert a blocked evaluation into the blocked eval
+// tracker. This allows the worker to act as the planner for the scheduler.
+func (w *Worker) ReblockEval(eval *structs.Evaluation) error {
+	// Check for a shutdown before plan submission
+	if w.srv.IsShutdown() {
+		return fmt.Errorf("shutdown while planning")
+	}
+	defer metrics.MeasureSince([]string{"nomad", "worker", "reblock_eval"}, time.Now())
+
+	// Store the snapshot index in the eval
+	eval.SnapshotIndex = w.snapshotIndex
+
+	// Setup the request
+	req := structs.EvalUpdateRequest{
+		Evals:     []*structs.Evaluation{eval},
+		EvalToken: w.evalToken,
+		WriteRequest: structs.WriteRequest{
+			Region: w.srv.config.Region,
+		},
+	}
+	var resp structs.GenericResponse
+
+SUBMIT:
+	// Make the RPC call
+	if err := w.srv.RPC("Eval.Reblock", &req, &resp); err != nil {
+		w.logger.Printf("[ERR] worker: failed to reblock evaluation %#v: %v",
+			eval, err)
+		if w.shouldResubmit(err) && !w.backoffErr(backoffBaselineSlow, backoffLimitSlow) {
+			goto SUBMIT
+		}
+		return err
+	} else {
+		w.logger.Printf("[DEBUG] worker: reblocked evaluation %#v", eval)
 		w.backoffReset()
 	}
 	return nil

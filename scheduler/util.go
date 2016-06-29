@@ -81,8 +81,17 @@ func diffAllocs(job *structs.Job, taintedNodes map[string]bool,
 			continue
 		}
 
-		// If we are on a tainted node, we must migrate
+		// If we are on a tainted node, we must migrate if we are a service or
+		// if the batch allocation did not finish
 		if taintedNodes[exist.NodeID] {
+			// If the job is batch and finished successfully, the fact that the
+			// node is tainted does not mean it should be migrated as the work
+			// was already successfully finished. However for service/system
+			// jobs, tasks should never complete. The check of batch type,
+			// defends against client bugs.
+			if exist.Job.Type == structs.JobTypeBatch && exist.RanSuccessfully() {
+				goto IGNORE
+			}
 			result.migrate = append(result.migrate, allocTuple{
 				Name:      name,
 				TaskGroup: tg,
@@ -102,6 +111,7 @@ func diffAllocs(job *structs.Job, taintedNodes map[string]bool,
 		}
 
 		// Everything is up-to-date
+	IGNORE:
 		result.ignore = append(result.ignore, allocTuple{
 			Name:      name,
 			TaskGroup: tg,
@@ -356,13 +366,20 @@ func networkPortMap(n *structs.NetworkResource) map[string]int {
 }
 
 // setStatus is used to update the status of the evaluation
-func setStatus(logger *log.Logger, planner Planner, eval, nextEval *structs.Evaluation, status, desc string) error {
+func setStatus(logger *log.Logger, planner Planner,
+	eval, nextEval, spawnedBlocked *structs.Evaluation,
+	tgMetrics map[string]*structs.AllocMetric, status, desc string) error {
+
 	logger.Printf("[DEBUG] sched: %#v: setting status to %s", eval, status)
 	newEval := eval.Copy()
 	newEval.Status = status
 	newEval.StatusDescription = desc
+	newEval.FailedTGAllocs = tgMetrics
 	if nextEval != nil {
 		newEval.NextEval = nextEval.ID
+	}
+	if spawnedBlocked != nil {
+		newEval.BlockedEval = spawnedBlocked.ID
 	}
 	return planner.UpdateEval(newEval)
 }
@@ -438,7 +455,6 @@ func inplaceUpdate(ctx Context, eval *structs.Evaluation, job *structs.Job,
 		newAlloc.Metrics = ctx.Metrics()
 		newAlloc.DesiredStatus = structs.AllocDesiredStatusRun
 		newAlloc.ClientStatus = structs.AllocClientStatusPending
-		newAlloc.PopulateServiceIDs(update.TaskGroup)
 		ctx.Plan().AppendAlloc(newAlloc)
 
 		// Remove this allocation from the slice

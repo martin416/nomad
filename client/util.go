@@ -7,7 +7,6 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
-	"time"
 
 	"github.com/hashicorp/nomad/nomad/structs"
 )
@@ -69,11 +68,6 @@ func diffAllocs(existing []*structs.Allocation, allocs *allocUpdates) *diffResul
 	return result
 }
 
-// Returns a random stagger interval between 0 and the duration
-func randomStagger(intv time.Duration) time.Duration {
-	return time.Duration(uint64(rand.Int63()) % uint64(intv))
-}
-
 // shuffleStrings randomly shuffles the list of strings
 func shuffleStrings(list []string) {
 	for i := range list {
@@ -91,8 +85,12 @@ func persistState(path string, data interface{}) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return fmt.Errorf("failed to make dirs for %s: %v", path, err)
 	}
-	if err := ioutil.WriteFile(path, buf, 0600); err != nil {
-		return fmt.Errorf("failed to save state: %v", err)
+	tmpPath := path + ".tmp"
+	if err := ioutil.WriteFile(tmpPath, buf, 0600); err != nil {
+		return fmt.Errorf("failed to save state to tmp: %v", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("failed to rename tmp to path: %v", err)
 	}
 	return nil
 }

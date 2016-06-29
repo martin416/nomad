@@ -3,12 +3,13 @@ package config
 import (
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/hashicorp/nomad/client/consul"
 	"github.com/hashicorp/nomad/nomad/structs"
+	"github.com/hashicorp/nomad/nomad/structs/config"
 )
 
 var (
@@ -110,8 +111,12 @@ type Config struct {
 	// Revision is the commit number of the Nomad client
 	Revision string
 
-	// ConsulConfig is the configuration to connect with Consul Agent
-	ConsulConfig *consul.ConsulConfig
+	// ConsulConfig is this Agent's Consul configuration
+	ConsulConfig *config.ConsulConfig
+
+	// StatsCollectionInterval is the interval at which the Nomad client
+	// collects resource usage stats
+	StatsCollectionInterval time.Duration
 }
 
 func (c *Config) Copy() *Config {
@@ -121,6 +126,16 @@ func (c *Config) Copy() *Config {
 	nc.Servers = structs.CopySliceString(nc.Servers)
 	nc.Options = structs.CopyMapStringString(nc.Options)
 	return nc
+}
+
+// DefaultConfig returns the default configuration
+func DefaultConfig() *Config {
+	return &Config{
+		ConsulConfig:            config.DefaultConsulConfig(),
+		LogOutput:               os.Stderr,
+		Region:                  "global",
+		StatsCollectionInterval: 1 * time.Second,
+	}
 }
 
 // Read returns the specified configuration value or "".

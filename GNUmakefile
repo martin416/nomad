@@ -5,7 +5,6 @@ EXTERNAL_TOOLS=\
 	github.com/kardianos/govendor \
 	github.com/mitchellh/gox \
 	golang.org/x/tools/cmd/cover \
-	golang.org/x/tools/cmd/vet \
 	github.com/axw/gocov/gocov \
 	gopkg.in/matm/v1/gocov-html \
 	github.com/ugorji/go/codec/codecgen
@@ -71,6 +70,9 @@ bootstrap:
 		echo "Installing $$tool" ; \
     go get $$tool; \
 	done
+
+install: bin/nomad
+	install -o root -g wheel -m 0755 ./bin/nomad /usr/local/bin/nomad
 
 travis:
 	@sudo apt-get install -y qemu

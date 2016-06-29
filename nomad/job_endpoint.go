@@ -13,6 +13,12 @@ import (
 	"github.com/hashicorp/nomad/scheduler"
 )
 
+const (
+	// RegisterEnforceIndexErrPrefix is the prefix to use in errors caused by
+	// enforcing the job modify index during registers.
+	RegisterEnforceIndexErrPrefix = "Enforcing job modify index"
+)
+
 // Job endpoint is used for job interactions
 type Job struct {
 	srv *Server
@@ -36,6 +42,29 @@ func (j *Job) Register(args *structs.JobRegisterRequest, reply *structs.JobRegis
 	// Validate the job.
 	if err := validateJob(args.Job); err != nil {
 		return err
+	}
+
+	if args.EnforceIndex {
+		// Lookup the job
+		snap, err := j.srv.fsm.State().Snapshot()
+		if err != nil {
+			return err
+		}
+		job, err := snap.JobByID(args.Job.ID)
+		if err != nil {
+			return err
+		}
+		jmi := args.JobModifyIndex
+		if job != nil {
+			if jmi == 0 {
+				return fmt.Errorf("%s 0: job already exists", RegisterEnforceIndexErrPrefix)
+			} else if jmi != job.JobModifyIndex {
+				return fmt.Errorf("%s %d: job exists with conflicting job modify index: %d",
+					RegisterEnforceIndexErrPrefix, jmi, job.JobModifyIndex)
+			}
+		} else if jmi != 0 {
+			return fmt.Errorf("%s %d: job does not exist", RegisterEnforceIndexErrPrefix, jmi)
+		}
 	}
 
 	// Commit this update via Raft
@@ -422,12 +451,14 @@ func (j *Job) Plan(args *structs.JobPlanRequest, reply *structs.JobPlanResponse)
 	}
 
 	var index uint64
+	var updatedIndex uint64
 	if oldJob != nil {
-		index = oldJob.JobModifyIndex + 1
+		index = oldJob.JobModifyIndex
+		updatedIndex = oldJob.JobModifyIndex + 1
 	}
 
 	// Insert the updated Job into the snapshot
-	snap.UpsertJob(index, args.Job)
+	snap.UpsertJob(updatedIndex, args.Job)
 
 	// Create an eval and mark it as requiring annotations and insert that as well
 	eval := &structs.Evaluation{
@@ -436,7 +467,7 @@ func (j *Job) Plan(args *structs.JobPlanRequest, reply *structs.JobPlanResponse)
 		Type:           args.Job.Type,
 		TriggeredBy:    structs.EvalTriggerJobRegister,
 		JobID:          args.Job.ID,
-		JobModifyIndex: index,
+		JobModifyIndex: updatedIndex,
 		Status:         structs.EvalStatusPending,
 		AnnotatePlan:   true,
 	}
@@ -459,7 +490,7 @@ func (j *Job) Plan(args *structs.JobPlanRequest, reply *structs.JobPlanResponse)
 
 	// Annotate and store the diff
 	if plans := len(planner.Plans); plans != 1 {
-		return fmt.Errorf("scheduler resulted in an unexpected number of plans: %d", plans)
+		return fmt.Errorf("scheduler resulted in an unexpected number of plans: %v", plans)
 	}
 	annotations := planner.Plans[0].Annotations
 	if args.Diff {
@@ -474,6 +505,18 @@ func (j *Job) Plan(args *structs.JobPlanRequest, reply *structs.JobPlanResponse)
 		reply.Diff = jobDiff
 	}
 
+	// Grab the failures
+	if len(planner.Evals) != 1 {
+		return fmt.Errorf("scheduler resulted in an unexpected number of eval updates: %v", planner.Evals)
+	}
+	updatedEval := planner.Evals[0]
+
+	// If it is a periodic job calculate the next launch
+	if args.Job.IsPeriodic() && args.Job.Periodic.Enabled {
+		reply.NextPeriodicLaunch = args.Job.Periodic.Next(time.Now().UTC())
+	}
+
+	reply.FailedTGAllocs = updatedEval.FailedTGAllocs
 	reply.JobModifyIndex = index
 	reply.Annotations = annotations
 	reply.CreatedEvals = planner.CreateEvals

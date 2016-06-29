@@ -28,6 +28,8 @@ General Options:
 
   ` + generalOptionsUsage() + `
 
+FS Specific Options:
+
   -H
     Machine friendly output.
 
@@ -171,7 +173,7 @@ nomad alloc-status %s`, allocID, allocID)
 			if machine {
 				size = fmt.Sprintf("%d", file.Size)
 			} else {
-				size = humanize.Bytes(uint64(file.Size))
+				size = humanize.IBytes(uint64(file.Size))
 			}
 			out[1] = fmt.Sprintf("%s|%s|%s|%s", file.FileMode, size,
 				formatTime(file.ModTime), fn)
@@ -190,7 +192,7 @@ nomad alloc-status %s`, allocID, allocID)
 		}
 		// Display the file information in a tabular format
 		out := make([]string, len(files)+1)
-		out[0] = "Mode|Size|Modfied Time|Name"
+		out[0] = "Mode|Size|Modified Time|Name"
 		for i, file := range files {
 			fn := file.Name
 			if file.IsDir {
@@ -200,7 +202,7 @@ nomad alloc-status %s`, allocID, allocID)
 			if machine {
 				size = fmt.Sprintf("%d", file.Size)
 			} else {
-				size = humanize.Bytes(uint64(file.Size))
+				size = humanize.IBytes(uint64(file.Size))
 			}
 			out[i+1] = fmt.Sprintf("%s|%s|%s|%s",
 				file.FileMode,

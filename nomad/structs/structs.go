@@ -54,6 +54,21 @@ const (
 	// that new commands can be added in a way that won't cause
 	// old servers to crash when the FSM attempts to process them.
 	IgnoreUnknownTypeFlag MessageType = 128
+
+	// ApiMajorVersion is returned as part of the Status.Version request.
+	// It should be incremented anytime the APIs are changed in a way
+	// that would break clients for sane client versioning.
+	ApiMajorVersion = 1
+
+	// ApiMinorVersion is returned as part of the Status.Version request.
+	// It should be incremented anytime the APIs are changed to allow
+	// for sane client versioning. Minor changes should be compatible
+	// within the major version.
+	ApiMinorVersion = 1
+
+	ProtocolVersion = "protocol"
+	APIMajorVersion = "api.major"
+	APIMinorVersion = "api.minor"
 )
 
 // RPCInfo is used to describe common information about query
@@ -151,6 +166,25 @@ type NodeDeregisterRequest struct {
 	WriteRequest
 }
 
+// NodeServerInfo is used to in NodeUpdateResponse to return Nomad server
+// information used in RPC server lists.
+type NodeServerInfo struct {
+	// RPCAdvertiseAddr is the IP endpoint that a Nomad Server wishes to
+	// be contacted at for RPCs.
+	RPCAdvertiseAddr string
+
+	// RpcMajorVersion is the major version number the Nomad Server
+	// supports
+	RPCMajorVersion int32
+
+	// RpcMinorVersion is the minor version number the Nomad Server
+	// supports
+	RPCMinorVersion int32
+
+	// Datacenter is the datacenter that a Nomad server belongs to
+	Datacenter string
+}
+
 // NodeUpdateStatusRequest is used for Node.UpdateStatus endpoint
 // to update the status of a node.
 type NodeUpdateStatusRequest struct {
@@ -182,6 +216,13 @@ type NodeSpecificRequest struct {
 // to register a job as being a schedulable entity.
 type JobRegisterRequest struct {
 	Job *Job
+
+	// If EnforceIndex is set then the job will only be registered if the passed
+	// JobModifyIndex matches the current Jobs index. If the index is zero, the
+	// register only occurs if the job is new.
+	EnforceIndex   bool
+	JobModifyIndex uint64
+
 	WriteRequest
 }
 
@@ -292,7 +333,7 @@ type AllocSpecificRequest struct {
 	QueryOptions
 }
 
-// AllocsGetcRequest is used to query a set of allocations
+// AllocsGetRequest is used to query a set of allocations
 type AllocsGetRequest struct {
 	AllocIDs []string
 	QueryOptions
@@ -315,12 +356,6 @@ type GenericRequest struct {
 type GenericResponse struct {
 	WriteMeta
 }
-
-const (
-	ProtocolVersion = "protocol"
-	APIMajorVersion = "api.major"
-	APIMinorVersion = "api.minor"
-)
 
 // VersionResponse is used for the Status.Version reseponse
 type VersionResponse struct {
@@ -351,6 +386,20 @@ type NodeUpdateResponse struct {
 	EvalIDs         []string
 	EvalCreateIndex uint64
 	NodeModifyIndex uint64
+
+	// LeaderRPCAddr is the RPC address of the current Raft Leader.  If
+	// empty, the current Nomad Server is in the minority of a partition.
+	LeaderRPCAddr string
+
+	// NumNodes is the number of Nomad nodes attached to this quorum of
+	// Nomad Servers at the time of the response.  This value can
+	// fluctuate based on the health of the cluster between heartbeats.
+	NumNodes int32
+
+	// Servers is the full list of known Nomad servers in the local
+	// region.
+	Servers []*NodeServerInfo
+
 	QueryMeta
 }
 
@@ -403,6 +452,9 @@ type JobPlanResponse struct {
 	// Annotations stores annotations explaining decisions the scheduler made.
 	Annotations *PlanAnnotations
 
+	// FailedTGAllocs is the placement failures per task group.
+	FailedTGAllocs map[string]*AllocMetric
+
 	// JobModifyIndex is the modification index of the job. The value can be
 	// used when running `nomad run` to ensure that the Job wasn’t modified
 	// since the last plan. If the job is being created, the value is zero.
@@ -415,6 +467,10 @@ type JobPlanResponse struct {
 	// Diff contains the diff of the job and annotations on whether the change
 	// causes an in-place update or create/destroy
 	Diff *JobDiff
+
+	// NextPeriodicLaunch is the time duration till the job would be launched if
+	// submitted.
+	NextPeriodicLaunch time.Time
 
 	WriteMeta
 }
@@ -1072,6 +1128,7 @@ func (j *Job) Stub() *JobListStub {
 		StatusDescription: j.StatusDescription,
 		CreateIndex:       j.CreateIndex,
 		ModifyIndex:       j.ModifyIndex,
+		JobModifyIndex:    j.JobModifyIndex,
 	}
 }
 
@@ -1092,6 +1149,7 @@ type JobListStub struct {
 	StatusDescription string
 	CreateIndex       uint64
 	ModifyIndex       uint64
+	JobModifyIndex    uint64
 }
 
 // UpdateStrategy is used to modify how updates are done
@@ -1428,10 +1486,19 @@ func (tg *TaskGroup) GoString() string {
 }
 
 const (
+	// TODO add Consul TTL check
 	ServiceCheckHTTP   = "http"
 	ServiceCheckTCP    = "tcp"
-	ServiceCheckDocker = "docker"
 	ServiceCheckScript = "script"
+
+	// minCheckInterval is the minimum check interval permitted.  Consul
+	// currently has its MinInterval set to 1s.  Mirror that here for
+	// consistency.
+	minCheckInterval = 1 * time.Second
+
+	// minCheckTimeout is the minimum check timeout permitted for Consul
+	// script TTL checks.
+	minCheckTimeout = 1 * time.Second
 )
 
 // The ServiceCheck data model represents the consul health check that
@@ -1456,22 +1523,36 @@ func (sc *ServiceCheck) Copy() *ServiceCheck {
 	return nsc
 }
 
-func (sc *ServiceCheck) Validate() error {
-	t := strings.ToLower(sc.Type)
-	if t != ServiceCheckTCP && t != ServiceCheckHTTP && t != ServiceCheckScript {
-		return fmt.Errorf("service check must be either http, tcp or script type")
-	}
-	if sc.Type == ServiceCheckHTTP && sc.Path == "" {
-		return fmt.Errorf("service checks of http type must have a valid http path")
+// validate a Service's ServiceCheck
+func (sc *ServiceCheck) validate() error {
+	switch strings.ToLower(sc.Type) {
+	case ServiceCheckTCP:
+		if sc.Timeout > 0 && sc.Timeout <= minCheckTimeout {
+			return fmt.Errorf("timeout %v is lower than required minimum timeout %v", sc.Timeout, minCheckInterval)
+		}
+	case ServiceCheckHTTP:
+		if sc.Path == "" {
+			return fmt.Errorf("http type must have a valid http path")
+		}
+
+		if sc.Timeout > 0 && sc.Timeout <= minCheckTimeout {
+			return fmt.Errorf("timeout %v is lower than required minimum timeout %v", sc.Timeout, minCheckInterval)
+		}
+	case ServiceCheckScript:
+		if sc.Command == "" {
+			return fmt.Errorf("script type must have a valid script path")
+		}
+
+		// TODO: enforce timeout on the Client side and reenable
+		// validation.
+	default:
+		return fmt.Errorf(`invalid type (%+q), must be one of "http", "tcp", or "script" type`, sc.Type)
 	}
 
-	if sc.Type == ServiceCheckScript && sc.Command == "" {
-		return fmt.Errorf("service checks of script type must have a valid script path")
+	if sc.Interval > 0 && sc.Interval <= minCheckInterval {
+		return fmt.Errorf("interval (%v) can not be lower than %v", sc.Interval, minCheckInterval)
 	}
 
-	if sc.Interval <= 0 {
-		return fmt.Errorf("service checks must have positive time intervals")
-	}
 	return nil
 }
 
@@ -1499,19 +1580,18 @@ func (sc *ServiceCheck) Hash(serviceID string) string {
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
-const (
-	NomadConsulPrefix = "nomad-registered-service"
-)
-
-var (
-	AgentServicePrefix = fmt.Sprintf("%s-%s", NomadConsulPrefix, "agent")
-)
-
-// The Service model represents a Consul service definition
+// Service represents a Consul service definition in Nomad
 type Service struct {
-	Name      string          // Name of the service, defaults to id
+	// Name of the service registered with Consul. Consul defaults the
+	// Name to ServiceID if not specified.  The Name if specified is used
+	// as one of the seed values when generating a Consul ServiceID.
+	Name string
+
+	// PortLabel is either the numeric port number or the `host:port`.
+	// To specify the port number using the host's Consul Advertise
+	// address, specify an empty host in the PortLabel (e.g. `:port`).
+	PortLabel string          `mapstructure:"port"`
 	Tags      []string        // List of tags for the service
-	PortLabel string          `mapstructure:"port"` // port for the service
 	Checks    []*ServiceCheck // List of checks associated with the service
 }
 
@@ -1552,10 +1632,6 @@ func (s *Service) InitFields(job string, taskGroup string, task string) {
 	}
 }
 
-func (s *Service) ID(identifier string) string {
-	return fmt.Sprintf("%s-%s-%s", NomadConsulPrefix, identifier, s.Hash())
-}
-
 // Validate checks if the Check definition is valid
 func (s *Service) Validate() error {
 	var mErr multierror.Error
@@ -1571,11 +1647,12 @@ func (s *Service) Validate() error {
 
 	for _, c := range s.Checks {
 		if s.PortLabel == "" && c.RequiresPort() {
-			mErr.Errors = append(mErr.Errors, fmt.Errorf("check %q is not valid since service %q doesn't have port", c.Name, s.Name))
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("check %s invalid: check requires a port but the service %+q has no port", c.Name))
 			continue
 		}
-		if err := c.Validate(); err != nil {
-			mErr.Errors = append(mErr.Errors, err)
+
+		if err := c.validate(); err != nil {
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("check %s invalid: %v", c.Name, err))
 		}
 	}
 	return mErr.ErrorOrNil()
@@ -1741,6 +1818,11 @@ func (t *Task) Validate() error {
 	if t.Name == "" {
 		mErr.Errors = append(mErr.Errors, errors.New("Missing task name"))
 	}
+	if strings.ContainsAny(t.Name, `/\`) {
+		// We enforce this so that when creating the directory on disk it will
+		// not have any slashes.
+		mErr.Errors = append(mErr.Errors, errors.New("Task name can not include slashes"))
+	}
 	if t.Driver == "" {
 		mErr.Errors = append(mErr.Errors, errors.New("Missing task driver"))
 	}
@@ -1790,13 +1872,6 @@ func (t *Task) Validate() error {
 		}
 	}
 
-	// If the driver is java or qemu ensure that they have specified an
-	// artifact.
-	if (t.Driver == "qemu" || t.Driver == "java") && len(t.Artifacts) == 0 {
-		err := fmt.Errorf("must specify at least one artifact when using %q driver", t.Driver)
-		mErr.Errors = append(mErr.Errors, err)
-	}
-
 	return mErr.ErrorOrNil()
 }
 
@@ -1811,7 +1886,7 @@ func validateServices(t *Task) error {
 	knownServices := make(map[string]struct{})
 	for i, service := range t.Services {
 		if err := service.Validate(); err != nil {
-			outer := fmt.Errorf("service %d validation failed: %s", i, err)
+			outer := fmt.Errorf("service[%d] %+q validation failed: %s", i, service.Name, err)
 			mErr.Errors = append(mErr.Errors, outer)
 		}
 		if _, ok := knownServices[service.Name]; ok {
@@ -1902,6 +1977,21 @@ func (ts *TaskState) Failed() bool {
 	default:
 		return false
 	}
+}
+
+// Successful returns whether a task finished successfully.
+func (ts *TaskState) Successful() bool {
+	l := len(ts.Events)
+	if ts.State != TaskStateDead || l == 0 {
+		return false
+	}
+
+	e := ts.Events[l-1]
+	if e.Type != TaskTerminated {
+		return false
+	}
+
+	return e.ExitCode == 0
 }
 
 const (
@@ -2245,9 +2335,6 @@ type Allocation struct {
 	// task. These should sum to the total Resources.
 	TaskResources map[string]*Resources
 
-	// Services is a map of service names to service ids
-	Services map[string]string
-
 	// Metrics associated with this allocation
 	Metrics *AllocMetric
 
@@ -2297,14 +2384,6 @@ func (a *Allocation) Copy() *Allocation {
 		na.TaskResources = tr
 	}
 
-	if a.Services != nil {
-		s := make(map[string]string, len(na.Services))
-		for service, id := range na.Services {
-			s[service] = id
-		}
-		na.Services = s
-	}
-
 	na.Metrics = na.Metrics.Copy()
 
 	if a.TaskStates != nil {
@@ -2336,6 +2415,23 @@ func (a *Allocation) TerminalStatus() bool {
 	}
 }
 
+// RanSuccessfully returns whether the client has ran the allocation and all
+// tasks finished successfully
+func (a *Allocation) RanSuccessfully() bool {
+	// Handle the case the client hasn't started the allocation.
+	if len(a.TaskStates) == 0 {
+		return false
+	}
+
+	// Check to see if all the tasks finised successfully in the allocation
+	allSuccess := true
+	for _, state := range a.TaskStates {
+		allSuccess = allSuccess && state.Successful()
+	}
+
+	return allSuccess
+}
+
 // Stub returns a list stub for the allocation
 func (a *Allocation) Stub() *AllocListStub {
 	return &AllocListStub{
@@ -2353,31 +2449,6 @@ func (a *Allocation) Stub() *AllocListStub {
 		CreateIndex:        a.CreateIndex,
 		ModifyIndex:        a.ModifyIndex,
 		CreateTime:         a.CreateTime,
-	}
-}
-
-// PopulateServiceIDs generates the service IDs for all the service definitions
-// in that Allocation
-func (a *Allocation) PopulateServiceIDs(tg *TaskGroup) {
-	// Retain the old services, and re-initialize. We may be removing
-	// services, so we cannot update the existing map.
-	previous := a.Services
-	a.Services = make(map[string]string)
-
-	for _, task := range tg.Tasks {
-		for _, service := range task.Services {
-			// Retain the service if an ID is already generated
-			if id, ok := previous[service.Name]; ok {
-				a.Services[service.Name] = id
-				continue
-			}
-
-			// If the service hasn't been generated an ID, we generate one.
-			// We add a prefix to the Service ID so that we can know that this service
-			// is managed by Nomad since Consul can also have service which are not
-			// managed by Nomad
-			a.Services[service.Name] = fmt.Sprintf("%s-%s", NomadConsulPrefix, GenerateUUID())
-		}
 	}
 }
 
@@ -2538,6 +2609,7 @@ const (
 	EvalTriggerNodeUpdate    = "node-update"
 	EvalTriggerScheduled     = "scheduled"
 	EvalTriggerRollingUpdate = "rolling-update"
+	EvalTriggerMaxPlans      = "max-plan-attempts"
 )
 
 const (
@@ -2617,6 +2689,16 @@ type Evaluation struct {
 	// This is used to support rolling upgrades, where we need a chain of evaluations.
 	PreviousEval string
 
+	// BlockedEval is the evaluation ID for a created blocked eval. A
+	// blocked eval will be created if all allocations could not be placed due
+	// to constraints or lacking resources.
+	BlockedEval string
+
+	// FailedTGAllocs are task groups which have allocations that could not be
+	// made, but the metrics are persisted so that the user can use the feedback
+	// to determine the cause.
+	FailedTGAllocs map[string]*AllocMetric
+
 	// ClassEligibility tracks computed node classes that have been explicitly
 	// marked as eligible or ineligible.
 	ClassEligibility map[string]bool
@@ -2628,6 +2710,11 @@ type Evaluation struct {
 	// AnnotatePlan triggers the scheduler to provide additional annotations
 	// during the evaluation. This should not be set during normal operations.
 	AnnotatePlan bool
+
+	// SnapshotIndex is the Raft index of the snapshot used to process the
+	// evaluation. As such it will only be set once it has gone through the
+	// scheduler.
+	SnapshotIndex uint64
 
 	// Raft Indexes
 	CreateIndex uint64
@@ -2655,6 +2742,25 @@ func (e *Evaluation) Copy() *Evaluation {
 	}
 	ne := new(Evaluation)
 	*ne = *e
+
+	// Copy ClassEligibility
+	if e.ClassEligibility != nil {
+		classes := make(map[string]bool, len(e.ClassEligibility))
+		for class, elig := range e.ClassEligibility {
+			classes[class] = elig
+		}
+		ne.ClassEligibility = classes
+	}
+
+	// Copy FailedTGAllocs
+	if e.FailedTGAllocs != nil {
+		failedTGs := make(map[string]*AllocMetric, len(e.FailedTGAllocs))
+		for tg, metric := range e.FailedTGAllocs {
+			failedTGs[tg] = metric.Copy()
+		}
+		ne.FailedTGAllocs = failedTGs
+	}
+
 	return ne
 }
 
@@ -2715,10 +2821,10 @@ func (e *Evaluation) NextRollingEval(wait time.Duration) *Evaluation {
 	}
 }
 
-// BlockedEval creates a blocked evaluation to followup this eval to place any
+// CreateBlockedEval creates a blocked evaluation to followup this eval to place any
 // failed allocations. It takes the classes marked explicitly eligible or
 // ineligible and whether the job has escaped computed node classes.
-func (e *Evaluation) BlockedEval(classEligibility map[string]bool, escaped bool) *Evaluation {
+func (e *Evaluation) CreateBlockedEval(classEligibility map[string]bool, escaped bool) *Evaluation {
 	return &Evaluation{
 		ID:                   GenerateUUID(),
 		Priority:             e.Priority,
@@ -2769,11 +2875,6 @@ type Plan struct {
 	// The evicts must be considered prior to the allocations.
 	NodeAllocation map[string][]*Allocation
 
-	// FailedAllocs are allocations that could not be made,
-	// but are persisted so that the user can use the feedback
-	// to determine the cause.
-	FailedAllocs []*Allocation
-
 	// Annotations contains annotations by the scheduler to be used by operators
 	// to understand the decisions made by the scheduler.
 	Annotations *PlanAnnotations
@@ -2821,13 +2922,9 @@ func (p *Plan) AppendAlloc(alloc *Allocation) {
 	p.NodeAllocation[node] = append(existing, alloc)
 }
 
-func (p *Plan) AppendFailed(alloc *Allocation) {
-	p.FailedAllocs = append(p.FailedAllocs, alloc)
-}
-
 // IsNoOp checks if this plan would do nothing
 func (p *Plan) IsNoOp() bool {
-	return len(p.NodeUpdate) == 0 && len(p.NodeAllocation) == 0 && len(p.FailedAllocs) == 0
+	return len(p.NodeUpdate) == 0 && len(p.NodeAllocation) == 0
 }
 
 // PlanResult is the result of a plan submitted to the leader.
@@ -2837,11 +2934,6 @@ type PlanResult struct {
 
 	// NodeAllocation contains all the allocations that were committed.
 	NodeAllocation map[string][]*Allocation
-
-	// FailedAllocs are allocations that could not be made,
-	// but are persisted so that the user can use the feedback
-	// to determine the cause.
-	FailedAllocs []*Allocation
 
 	// RefreshIndex is the index the worker should refresh state up to.
 	// This allows all evictions and allocations to be materialized.
@@ -2856,7 +2948,7 @@ type PlanResult struct {
 
 // IsNoOp checks if this plan result would do nothing
 func (p *PlanResult) IsNoOp() bool {
-	return len(p.NodeUpdate) == 0 && len(p.NodeAllocation) == 0 && len(p.FailedAllocs) == 0
+	return len(p.NodeUpdate) == 0 && len(p.NodeAllocation) == 0
 }
 
 // FullCommit is used to check if all the allocations in a plan

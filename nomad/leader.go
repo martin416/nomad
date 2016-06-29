@@ -11,6 +11,13 @@ import (
 	"github.com/hashicorp/serf/serf"
 )
 
+const (
+	// failedEvalUnblockInterval is the interval at which failed evaluations are
+	// unblocked to re-enter the scheduler. A failed evaluation occurs under
+	// high contention when the schedulers plan does not make progress.
+	failedEvalUnblockInterval = 1 * time.Minute
+)
+
 // monitorLeadership is used to monitor if we acquire or lose our role
 // as the leader in the Raft cluster. There is some work the leader is
 // expected to do, so we must react to changes
@@ -143,6 +150,9 @@ func (s *Server) establishLeadership(stopCh chan struct{}) error {
 	// Reap any duplicate blocked evaluations
 	go s.reapDupBlockedEvaluations(stopCh)
 
+	// Periodically unblock failed allocations
+	go s.periodicUnblockFailedEvals(stopCh)
+
 	// Setup the heartbeat timers. This is done both when starting up or when
 	// a leader fail over happens. Since the timers are maintained by the leader
 	// node, effectively this means all the timers are renewed at the time of failover.
@@ -178,9 +188,7 @@ func (s *Server) restoreEvals() error {
 		eval := raw.(*structs.Evaluation)
 
 		if eval.ShouldEnqueue() {
-			if err := s.evalBroker.Enqueue(eval); err != nil {
-				return fmt.Errorf("failed to enqueue evaluation %s: %v", eval.ID, err)
-			}
+			s.evalBroker.Enqueue(eval)
 		} else if eval.ShouldBlock() {
 			s.blockedEvals.Block(eval)
 		}
@@ -243,14 +251,33 @@ func (s *Server) schedulePeriodic(stopCh chan struct{}) {
 	jobGC := time.NewTicker(s.config.JobGCInterval)
 	defer jobGC.Stop()
 
+	// getLatest grabs the latest index from the state store. It returns true if
+	// the index was retrieved successfully.
+	getLatest := func() (uint64, bool) {
+		snapshotIndex, err := s.fsm.State().LatestIndex()
+		if err != nil {
+			s.logger.Printf("[ERR] nomad: failed to determine state store's index: %v", err)
+			return 0, false
+		}
+
+		return snapshotIndex, true
+	}
+
 	for {
+
 		select {
 		case <-evalGC.C:
-			s.evalBroker.Enqueue(s.coreJobEval(structs.CoreJobEvalGC))
+			if index, ok := getLatest(); ok {
+				s.evalBroker.Enqueue(s.coreJobEval(structs.CoreJobEvalGC, index))
+			}
 		case <-nodeGC.C:
-			s.evalBroker.Enqueue(s.coreJobEval(structs.CoreJobNodeGC))
+			if index, ok := getLatest(); ok {
+				s.evalBroker.Enqueue(s.coreJobEval(structs.CoreJobNodeGC, index))
+			}
 		case <-jobGC.C:
-			s.evalBroker.Enqueue(s.coreJobEval(structs.CoreJobJobGC))
+			if index, ok := getLatest(); ok {
+				s.evalBroker.Enqueue(s.coreJobEval(structs.CoreJobJobGC, index))
+			}
 		case <-stopCh:
 			return
 		}
@@ -258,7 +285,7 @@ func (s *Server) schedulePeriodic(stopCh chan struct{}) {
 }
 
 // coreJobEval returns an evaluation for a core job
-func (s *Server) coreJobEval(job string) *structs.Evaluation {
+func (s *Server) coreJobEval(job string, modifyIndex uint64) *structs.Evaluation {
 	return &structs.Evaluation{
 		ID:          structs.GenerateUUID(),
 		Priority:    structs.CoreJobPriority,
@@ -266,7 +293,7 @@ func (s *Server) coreJobEval(job string) *structs.Evaluation {
 		TriggeredBy: structs.EvalTriggerScheduled,
 		JobID:       job,
 		Status:      structs.EvalStatusPending,
-		ModifyIndex: s.raft.AppliedIndex(),
+		ModifyIndex: modifyIndex,
 	}
 }
 
@@ -339,6 +366,21 @@ func (s *Server) reapDupBlockedEvaluations(stopCh chan struct{}) {
 				s.logger.Printf("[ERR] nomad: failed to update duplicate evals %#v: %v", cancel, err)
 				continue
 			}
+		}
+	}
+}
+
+// periodicUnblockFailedEvals periodically unblocks failed, blocked evaluations.
+func (s *Server) periodicUnblockFailedEvals(stopCh chan struct{}) {
+	ticker := time.NewTimer(failedEvalUnblockInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stopCh:
+			return
+		case <-ticker.C:
+			// Unblock the failed allocations
+			s.blockedEvals.UnblockFailed()
 		}
 	}
 }

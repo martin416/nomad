@@ -52,12 +52,7 @@ func TestWorker_dequeueEvaluation(t *testing.T) {
 
 	// Create the evaluation
 	eval1 := mock.Eval()
-	testutil.WaitForResult(func() (bool, error) {
-		err := s1.evalBroker.Enqueue(eval1)
-		return err == nil, err
-	}, func(err error) {
-		t.Fatalf("err: %v", err)
-	})
+	s1.evalBroker.Enqueue(eval1)
 
 	// Create a worker
 	w := &Worker{srv: s1, logger: s1.logger}
@@ -87,12 +82,7 @@ func TestWorker_dequeueEvaluation_paused(t *testing.T) {
 
 	// Create the evaluation
 	eval1 := mock.Eval()
-	testutil.WaitForResult(func() (bool, error) {
-		err := s1.evalBroker.Enqueue(eval1)
-		return err == nil, err
-	}, func(err error) {
-		t.Fatalf("err: %v", err)
-	})
+	s1.evalBroker.Enqueue(eval1)
 
 	// Create a worker
 	w := &Worker{srv: s1, logger: s1.logger}
@@ -163,12 +153,7 @@ func TestWorker_sendAck(t *testing.T) {
 
 	// Create the evaluation
 	eval1 := mock.Eval()
-	testutil.WaitForResult(func() (bool, error) {
-		err := s1.evalBroker.Enqueue(eval1)
-		return err == nil, err
-	}, func(err error) {
-		t.Fatalf("err: %v", err)
-	})
+	s1.evalBroker.Enqueue(eval1)
 
 	// Create a worker
 	w := &Worker{srv: s1, logger: s1.logger}
@@ -218,7 +203,10 @@ func TestWorker_waitForIndex(t *testing.T) {
 	// Cause an increment
 	go func() {
 		time.Sleep(10 * time.Millisecond)
-		s1.raft.Barrier(0)
+		n := mock.Node()
+		if err := s1.fsm.state.UpsertNode(index+1, n); err != nil {
+			t.Fatalf("failed to upsert node: %v", err)
+		}
 	}()
 
 	// Wait for a future index
@@ -266,12 +254,8 @@ func TestWorker_SubmitPlan(t *testing.T) {
 
 	// Create the register request
 	eval1 := mock.Eval()
-	testutil.WaitForResult(func() (bool, error) {
-		err := s1.evalBroker.Enqueue(eval1)
-		return err == nil, err
-	}, func(err error) {
-		t.Fatalf("err: %v", err)
-	})
+	s1.evalBroker.Enqueue(eval1)
+
 	evalOut, token, err := s1.evalBroker.Dequeue([]string{eval1.Type}, time.Second)
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -328,12 +312,8 @@ func TestWorker_SubmitPlan_MissingNodeRefresh(t *testing.T) {
 
 	// Create the register request
 	eval1 := mock.Eval()
-	testutil.WaitForResult(func() (bool, error) {
-		err := s1.evalBroker.Enqueue(eval1)
-		return err == nil, err
-	}, func(err error) {
-		t.Fatalf("err: %v", err)
-	})
+	s1.evalBroker.Enqueue(eval1)
+
 	evalOut, token, err := s1.evalBroker.Dequeue([]string{eval1.Type}, time.Second)
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -395,12 +375,7 @@ func TestWorker_UpdateEval(t *testing.T) {
 
 	// Create the register request
 	eval1 := mock.Eval()
-	testutil.WaitForResult(func() (bool, error) {
-		err := s1.evalBroker.Enqueue(eval1)
-		return err == nil, err
-	}, func(err error) {
-		t.Fatalf("err: %v", err)
-	})
+	s1.evalBroker.Enqueue(eval1)
 	evalOut, token, err := s1.evalBroker.Dequeue([]string{eval1.Type}, time.Second)
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -426,6 +401,9 @@ func TestWorker_UpdateEval(t *testing.T) {
 	if out.Status != structs.EvalStatusComplete {
 		t.Fatalf("bad: %v", out)
 	}
+	if out.SnapshotIndex != w.snapshotIndex {
+		t.Fatalf("bad: %v", out)
+	}
 }
 
 func TestWorker_CreateEval(t *testing.T) {
@@ -442,12 +420,8 @@ func TestWorker_CreateEval(t *testing.T) {
 
 	// Create the register request
 	eval1 := mock.Eval()
-	testutil.WaitForResult(func() (bool, error) {
-		err := s1.evalBroker.Enqueue(eval1)
-		return err == nil, err
-	}, func(err error) {
-		t.Fatalf("err: %v", err)
-	})
+	s1.evalBroker.Enqueue(eval1)
+
 	evalOut, token, err := s1.evalBroker.Dequeue([]string{eval1.Type}, time.Second)
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -472,5 +446,75 @@ func TestWorker_CreateEval(t *testing.T) {
 	}
 	if out.PreviousEval != eval1.ID {
 		t.Fatalf("bad: %v", out)
+	}
+	if out.SnapshotIndex != w.snapshotIndex {
+		t.Fatalf("bad: %v", out)
+	}
+}
+
+func TestWorker_ReblockEval(t *testing.T) {
+	s1 := testServer(t, func(c *Config) {
+		c.NumSchedulers = 0
+		c.EnabledSchedulers = []string{structs.JobTypeService}
+	})
+	defer s1.Shutdown()
+	testutil.WaitForLeader(t, s1.RPC)
+
+	// Create the blocked eval
+	eval1 := mock.Eval()
+	eval1.Status = structs.EvalStatusBlocked
+
+	// Insert it into the state store
+	if err := s1.fsm.State().UpsertEvals(1000, []*structs.Evaluation{eval1}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Enqueue the eval and then dequeue
+	s1.evalBroker.Enqueue(eval1)
+	evalOut, token, err := s1.evalBroker.Dequeue([]string{eval1.Type}, time.Second)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if evalOut != eval1 {
+		t.Fatalf("Bad eval")
+	}
+
+	eval2 := evalOut.Copy()
+
+	// Attempt to reblock eval
+	w := &Worker{srv: s1, logger: s1.logger, evalToken: token}
+	err = w.ReblockEval(eval2)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Ack the eval
+	w.sendAck(evalOut.ID, token, true)
+
+	// Check that it is blocked
+	bStats := s1.blockedEvals.Stats()
+	if bStats.TotalBlocked+bStats.TotalEscaped != 1 {
+		t.Fatalf("ReblockEval didn't insert eval into the blocked eval tracker: %#v", bStats)
+	}
+
+	// Check that the snapshot index was set properly by unblocking the eval and
+	// then dequeuing.
+	s1.blockedEvals.Unblock("foobar", 1000)
+
+	reblockedEval, _, err := s1.evalBroker.Dequeue([]string{eval1.Type}, 1*time.Second)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if reblockedEval == nil {
+		t.Fatalf("Nil eval")
+	}
+	if reblockedEval.ID != eval1.ID {
+		t.Fatalf("Bad eval")
+	}
+
+	// Check that the SnapshotIndex is set
+	if reblockedEval.SnapshotIndex != w.snapshotIndex {
+		t.Fatalf("incorrect snapshot index; got %d; want %d",
+			reblockedEval.SnapshotIndex, w.snapshotIndex)
 	}
 }

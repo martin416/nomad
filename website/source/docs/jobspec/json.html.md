@@ -210,7 +210,7 @@ The `Job` object supports the following keys:
 *   `Periodic` - `Periodic` allows the job to be scheduled at fixed times, dates
     or intervals. The periodic expression is always evaluated in the UTC
     timezone to ensure consistent evaluation when Nomad Servers span multiple
-    time zones. The `Periodic` object supports the following attributes:
+    time zones. The `Periodic` object is optional and supports the following attributes:
 
     * `Enabled` - `Enabled` determines whether the periodic job will spawn child
     jobs.
@@ -370,7 +370,7 @@ The `Task` object supports the following keys:
 
 
 * `User` - Set the user that will run the task. It defaults to the same user
-  the Nomad client is being run as.
+  the Nomad client is being run as. This can only be set on Linux platforms.
 
 ### Resources
 
@@ -526,6 +526,41 @@ An example of downloading and unzipping an archive is as simple as:
     "GetterOptions": {
       "checksum": "md5:7f4b3e3b4dd5150d4e5aaaa5efada4c3"
     }
+  }
+]
+```
+
+#### S3 examples
+
+S3 has several different types of addressing and more detail can be found
+[here](http://docs.aws.amazon.com/AmazonS3/latest/dev/UsingBucket.html#access-bucket-intro)
+
+S3 region specific endpoints can be found
+[here](http://docs.aws.amazon.com/general/latest/gr/rande.html#s3_region)
+
+Path based style:
+```
+"Artifacts": [
+  {
+    "GetterSource": "https://s3-us-west-2.amazonaws.com/my-bucket-example/my_app.tar.gz",
+  }
+]
+```
+
+or to override automatic detection in the url, use the s3 specific syntax
+```
+"Artifacts": [
+  {
+    "GetterSource": "s3::https://s3-eu-west-1.amazonaws.com/my-bucket-example/my_app.tar.gz",
+  }
+]
+```
+
+Virtual hosted based style
+```
+"Artifacts": [
+  {
+    "GetterSource": "my-bucket-example.s3-eu-west-1.amazonaws.com/my_app.tar.gz",
   }
 ]
 ```

@@ -5,18 +5,30 @@ import (
 	"io"
 	"log"
 	"net"
-	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/nomad/client"
 	clientconfig "github.com/hashicorp/nomad/client/config"
-	"github.com/hashicorp/nomad/client/consul"
+	"github.com/hashicorp/nomad/command/agent/consul"
 	"github.com/hashicorp/nomad/nomad"
 	"github.com/hashicorp/nomad/nomad/structs"
+)
+
+const (
+	clientHttpCheckInterval = 10 * time.Second
+	clientHttpCheckTimeout  = 3 * time.Second
+	serverHttpCheckInterval = 10 * time.Second
+	serverHttpCheckTimeout  = 3 * time.Second
+	serverRpcCheckInterval  = 10 * time.Second
+	serverRpcCheckTimeout   = 3 * time.Second
+	serverSerfCheckInterval = 10 * time.Second
+	serverSerfCheckTimeout  = 3 * time.Second
 )
 
 // Agent is a long running daemon that is used to run both
@@ -29,13 +41,16 @@ type Agent struct {
 	logger    *log.Logger
 	logOutput io.Writer
 
-	consulService  *consul.ConsulService // consulService registers the Nomad agent with the consul agent
-	consulConfig   *consul.ConsulConfig  // consulConfig is the consul configuration the Nomad client uses to connect with Consul agent
-	serverHTTPAddr string
+	// consulSyncer registers the Nomad agent with the Consul Agent
+	consulSyncer *consul.Syncer
+
+	client         *client.Client
 	clientHTTPAddr string
 
-	server *nomad.Server
-	client *client.Client
+	server         *nomad.Server
+	serverHTTPAddr string
+	serverRPCAddr  string
+	serverSerfAddr string
 
 	shutdown     bool
 	shutdownCh   chan struct{}
@@ -44,22 +59,16 @@ type Agent struct {
 
 // NewAgent is used to create a new agent with the given configuration
 func NewAgent(config *Config, logOutput io.Writer) (*Agent, error) {
-	// Ensure we have a log sink
-	if logOutput == nil {
-		logOutput = os.Stderr
-	}
-
 	a := &Agent{
 		config:     config,
-		logger:     log.New(logOutput, "", log.LstdFlags),
+		logger:     log.New(logOutput, "", log.LstdFlags|log.Lmicroseconds),
 		logOutput:  logOutput,
 		shutdownCh: make(chan struct{}),
 	}
 
-	// creating the consul client configuration that both the server and client
-	// uses
-	a.createConsulConfig()
-
+	if err := a.setupConsulSyncer(); err != nil {
+		return nil, fmt.Errorf("Failed to initialize Consul syncer task: %v", err)
+	}
 	if err := a.setupServer(); err != nil {
 		return nil, err
 	}
@@ -69,14 +78,16 @@ func NewAgent(config *Config, logOutput io.Writer) (*Agent, error) {
 	if a.client == nil && a.server == nil {
 		return nil, fmt.Errorf("must have at least client or server mode enabled")
 	}
-	if a.config.ConsulConfig.AutoRegister {
-		if err := a.syncAgentServicesWithConsul(a.serverHTTPAddr, a.clientHTTPAddr); err != nil {
-			a.logger.Printf("[ERR] agent: unable to sync agent services with consul: %v", err)
-		}
-		if a.consulService != nil {
-			go a.consulService.PeriodicSync()
-		}
-	}
+
+	// The Nomad Agent runs the consul.Syncer regardless of whether or not the
+	// Agent is running in Client or Server mode (or both), and regardless of
+	// the consul.auto_advertise parameter. The Client and Server both reuse the
+	// same consul.Syncer instance. This Syncer task periodically executes
+	// callbacks that update Consul. The reason the Syncer is always running is
+	// because one of the callbacks is attempts to self-bootstrap Nomad using
+	// information found in Consul.
+	go a.consulSyncer.Run()
+
 	return a, nil
 }
 
@@ -103,7 +114,7 @@ func (a *Agent) serverConfig() (*nomad.Config, error) {
 		if a.config.Server.BootstrapExpect == 1 {
 			conf.Bootstrap = true
 		} else {
-			conf.BootstrapExpect = a.config.Server.BootstrapExpect
+			atomic.StoreInt32(&conf.BootstrapExpect, int32(a.config.Server.BootstrapExpect))
 		}
 	}
 	if a.config.DataDir != "" {
@@ -159,10 +170,54 @@ func (a *Agent) serverConfig() (*nomad.Config, error) {
 	if port := a.config.Ports.Serf; port != 0 {
 		conf.SerfConfig.MemberlistConfig.BindPort = port
 	}
-	a.serverHTTPAddr = fmt.Sprintf("%v:%v", a.config.Addresses.HTTP, a.config.Ports.HTTP)
+
+	// Resolve the Server's HTTP Address
 	if a.config.AdvertiseAddrs.HTTP != "" {
 		a.serverHTTPAddr = a.config.AdvertiseAddrs.HTTP
+	} else if a.config.Addresses.HTTP != "" {
+		a.serverHTTPAddr = fmt.Sprintf("%v:%v", a.config.Addresses.HTTP, a.config.Ports.HTTP)
+	} else if a.config.BindAddr != "" {
+		a.serverHTTPAddr = fmt.Sprintf("%v:%v", a.config.BindAddr, a.config.Ports.HTTP)
+	} else {
+		a.serverHTTPAddr = fmt.Sprintf("%v:%v", "127.0.0.1", a.config.Ports.HTTP)
 	}
+	addr, err := net.ResolveTCPAddr("tcp", a.serverHTTPAddr)
+	if err != nil {
+		return nil, fmt.Errorf("error resolving HTTP addr %+q: %v", a.serverHTTPAddr, err)
+	}
+	a.serverHTTPAddr = fmt.Sprintf("%s:%d", addr.IP.String(), addr.Port)
+
+	// Resolve the Server's RPC Address
+	if a.config.AdvertiseAddrs.RPC != "" {
+		a.serverRPCAddr = a.config.AdvertiseAddrs.RPC
+	} else if a.config.Addresses.RPC != "" {
+		a.serverRPCAddr = fmt.Sprintf("%v:%v", a.config.Addresses.RPC, a.config.Ports.RPC)
+	} else if a.config.BindAddr != "" {
+		a.serverRPCAddr = fmt.Sprintf("%v:%v", a.config.BindAddr, a.config.Ports.RPC)
+	} else {
+		a.serverRPCAddr = fmt.Sprintf("%v:%v", "127.0.0.1", a.config.Ports.RPC)
+	}
+	addr, err = net.ResolveTCPAddr("tcp", a.serverRPCAddr)
+	if err != nil {
+		return nil, fmt.Errorf("error resolving RPC addr %+q: %v", a.serverRPCAddr, err)
+	}
+	a.serverRPCAddr = fmt.Sprintf("%s:%d", addr.IP.String(), addr.Port)
+
+	// Resolve the Server's Serf Address
+	if a.config.AdvertiseAddrs.Serf != "" {
+		a.serverSerfAddr = a.config.AdvertiseAddrs.Serf
+	} else if a.config.Addresses.Serf != "" {
+		a.serverSerfAddr = fmt.Sprintf("%v:%v", a.config.Addresses.Serf, a.config.Ports.Serf)
+	} else if a.config.BindAddr != "" {
+		a.serverSerfAddr = fmt.Sprintf("%v:%v", a.config.BindAddr, a.config.Ports.Serf)
+	} else {
+		a.serverSerfAddr = fmt.Sprintf("%v:%v", "127.0.0.1", a.config.Ports.Serf)
+	}
+	addr, err = net.ResolveTCPAddr("tcp", a.serverSerfAddr)
+	if err != nil {
+		return nil, fmt.Errorf("error resolving Serf addr %+q: %v", a.serverSerfAddr, err)
+	}
+	a.serverSerfAddr = fmt.Sprintf("%s:%d", addr.IP.String(), addr.Port)
 
 	if gcThreshold := a.config.Server.NodeGCThreshold; gcThreshold != "" {
 		dur, err := time.ParseDuration(gcThreshold)
@@ -180,16 +235,22 @@ func (a *Agent) serverConfig() (*nomad.Config, error) {
 		conf.HeartbeatGrace = dur
 	}
 
+	if a.config.Consul.AutoAdvertise && a.config.Consul.ServerServiceName == "" {
+		return nil, fmt.Errorf("server_service_name must be set when auto_advertise is enabled")
+	}
+
+	conf.ConsulConfig = a.config.Consul
+
 	return conf, nil
 }
 
 // clientConfig is used to generate a new client configuration struct
-// for initializing a nomad client.
+// for initializing a Nomad client.
 func (a *Agent) clientConfig() (*clientconfig.Config, error) {
 	// Setup the configuration
 	conf := a.config.ClientConfig
 	if conf == nil {
-		conf = client.DefaultConfig()
+		conf = clientconfig.DefaultConfig()
 	}
 	if a.server != nil {
 		conf.RPCHandler = a.server
@@ -214,6 +275,21 @@ func (a *Agent) clientConfig() (*clientconfig.Config, error) {
 		conf.NetworkInterface = a.config.Client.NetworkInterface
 	}
 	conf.Options = a.config.Client.Options
+	// Logging deprecation messages about consul related configuration in client
+	// options
+	var invalidConsulKeys []string
+	for key := range conf.Options {
+		if strings.HasPrefix(key, "consul") {
+			invalidConsulKeys = append(invalidConsulKeys, fmt.Sprintf("options.%s", key))
+		}
+	}
+	if len(invalidConsulKeys) > 0 {
+		a.logger.Printf("[WARN] agent: Invalid keys: %v", strings.Join(invalidConsulKeys, ","))
+		a.logger.Printf(`Nomad client ignores consul related configuration in client options. 
+		Please refer to the guide https://www.nomadproject.io/docs/agent/config.html#consul_options 
+		to configure Nomad to work with Consul.`)
+	}
+
 	if a.config.Client.NetworkSpeed != 0 {
 		conf.NetworkSpeed = a.config.Client.NetworkSpeed
 	}
@@ -234,20 +310,21 @@ func (a *Agent) clientConfig() (*clientconfig.Config, error) {
 	conf.Node.Meta = a.config.Client.Meta
 	conf.Node.NodeClass = a.config.Client.NodeClass
 
-	// Setting the proper HTTP Addr
-	httpAddr := fmt.Sprintf("%s:%d", a.config.BindAddr, a.config.Ports.HTTP)
-	if a.config.Addresses.HTTP != "" && a.config.AdvertiseAddrs.HTTP == "" {
-		httpAddr = fmt.Sprintf("%s:%d", a.config.Addresses.HTTP, a.config.Ports.HTTP)
-		if _, err := net.ResolveTCPAddr("tcp", httpAddr); err != nil {
-			return nil, fmt.Errorf("error resolving http addr: %v:", err)
-		}
-	} else if a.config.AdvertiseAddrs.HTTP != "" {
-		addr, err := net.ResolveTCPAddr("tcp", a.config.AdvertiseAddrs.HTTP)
-		if err != nil {
-			return nil, fmt.Errorf("error resolving advertise http addr: %v", err)
-		}
-		httpAddr = fmt.Sprintf("%s:%d", addr.IP.String(), addr.Port)
+	// Resolve the Client's HTTP address
+	if a.config.AdvertiseAddrs.HTTP != "" {
+		a.clientHTTPAddr = a.config.AdvertiseAddrs.HTTP
+	} else if a.config.Addresses.HTTP != "" {
+		a.clientHTTPAddr = fmt.Sprintf("%v:%v", a.config.Addresses.HTTP, a.config.Ports.HTTP)
+	} else if a.config.BindAddr != "" {
+		a.clientHTTPAddr = fmt.Sprintf("%v:%v", a.config.BindAddr, a.config.Ports.HTTP)
+	} else {
+		a.clientHTTPAddr = fmt.Sprintf("%v:%v", "127.0.0.1", a.config.Ports.HTTP)
 	}
+	addr, err := net.ResolveTCPAddr("tcp", a.clientHTTPAddr)
+	if err != nil {
+		return nil, fmt.Errorf("error resolving HTTP addr %+q: %v", a.clientHTTPAddr, err)
+	}
+	httpAddr := fmt.Sprintf("%s:%d", addr.IP.String(), addr.Port)
 	conf.Node.HTTPAddr = httpAddr
 	a.clientHTTPAddr = httpAddr
 
@@ -266,8 +343,12 @@ func (a *Agent) clientConfig() (*clientconfig.Config, error) {
 	conf.Version = fmt.Sprintf("%s%s", a.config.Version, a.config.VersionPrerelease)
 	conf.Revision = a.config.Revision
 
-	conf.ConsulConfig = a.consulConfig
+	if a.config.Consul.AutoAdvertise && a.config.Consul.ClientServiceName == "" {
+		return nil, fmt.Errorf("client_service_name must be set when auto_advertise is enabled")
+	}
 
+	conf.ConsulConfig = a.config.Consul
+	conf.StatsCollectionInterval = a.config.Telemetry.collectionInterval
 	return conf, nil
 }
 
@@ -284,12 +365,62 @@ func (a *Agent) setupServer() error {
 	}
 
 	// Create the server
-	server, err := nomad.NewServer(conf)
+	server, err := nomad.NewServer(conf, a.consulSyncer, a.logger)
 	if err != nil {
 		return fmt.Errorf("server setup failed: %v", err)
 	}
-
 	a.server = server
+
+	// Create the Nomad Server services for Consul
+	if a.config.Consul.AutoAdvertise {
+		httpServ := &structs.Service{
+			Name:      a.config.Consul.ServerServiceName,
+			PortLabel: a.serverHTTPAddr,
+			Tags:      []string{consul.ServiceTagHTTP},
+			Checks: []*structs.ServiceCheck{
+				&structs.ServiceCheck{
+					Name:     "Nomad Server HTTP Check",
+					Type:     "http",
+					Path:     "/v1/status/peers",
+					Protocol: "http", // TODO TLS
+					Interval: serverHttpCheckInterval,
+					Timeout:  serverHttpCheckTimeout,
+				},
+			},
+		}
+		rpcServ := &structs.Service{
+			Name:      a.config.Consul.ServerServiceName,
+			PortLabel: a.serverRPCAddr,
+			Tags:      []string{consul.ServiceTagRPC},
+			Checks: []*structs.ServiceCheck{
+				&structs.ServiceCheck{
+					Name:     "Nomad Server RPC Check",
+					Type:     "tcp",
+					Interval: serverRpcCheckInterval,
+					Timeout:  serverRpcCheckTimeout,
+				},
+			},
+		}
+		serfServ := &structs.Service{
+			PortLabel: a.serverSerfAddr,
+			Name:      a.config.Consul.ServerServiceName,
+			Tags:      []string{consul.ServiceTagSerf},
+			Checks: []*structs.ServiceCheck{
+				&structs.ServiceCheck{
+					Name:     "Nomad Server Serf Check",
+					Type:     "tcp",
+					Interval: serverSerfCheckInterval,
+					Timeout:  serverSerfCheckTimeout,
+				},
+			},
+		}
+		a.consulSyncer.SetServices(consul.ServerDomain, map[consul.ServiceKey]*structs.Service{
+			consul.GenerateServiceKey(httpServ): httpServ,
+			consul.GenerateServiceKey(rpcServ):  rpcServ,
+			consul.GenerateServiceKey(serfServ): serfServ,
+		})
+	}
+
 	return nil
 }
 
@@ -313,15 +444,38 @@ func (a *Agent) setupClient() error {
 	}
 
 	// Create the client
-	client, err := client.NewClient(conf)
+	client, err := client.NewClient(conf, a.consulSyncer, a.logger)
 	if err != nil {
 		return fmt.Errorf("client setup failed: %v", err)
 	}
 	a.client = client
+
+	// Create the Nomad Client  services for Consul
+	if a.config.Consul.AutoAdvertise {
+		httpServ := &structs.Service{
+			Name:      a.config.Consul.ClientServiceName,
+			PortLabel: a.clientHTTPAddr,
+			Tags:      []string{consul.ServiceTagHTTP},
+			Checks: []*structs.ServiceCheck{
+				&structs.ServiceCheck{
+					Name:     "Nomad Client HTTP Check",
+					Type:     "http",
+					Path:     "/v1/agent/servers",
+					Protocol: "http", // TODO TLS
+					Interval: clientHttpCheckInterval,
+					Timeout:  clientHttpCheckTimeout,
+				},
+			},
+		}
+		a.consulSyncer.SetServices(consul.ClientDomain, map[consul.ServiceKey]*structs.Service{
+			consul.GenerateServiceKey(httpServ): httpServ,
+		})
+	}
+
 	return nil
 }
 
-// reservePortsForClient reservers a range of ports for the client to use when
+// reservePortsForClient reserves a range of ports for the client to use when
 // it creates various plugins for log collection, executors, drivers, etc
 func (a *Agent) reservePortsForClient(conf *clientconfig.Config) error {
 	// finding the device name for loopback
@@ -429,10 +583,8 @@ func (a *Agent) Shutdown() error {
 		}
 	}
 
-	if a.consulService != nil {
-		if err := a.consulService.Shutdown(); err != nil {
-			a.logger.Printf("[ERR] agent: shutting down consul service failed: %v", err)
-		}
+	if err := a.consulSyncer.Shutdown(); err != nil {
+		a.logger.Printf("[ERR] agent: shutting down consul service failed: %v", err)
 	}
 
 	a.logger.Println("[INFO] agent: shutdown complete")
@@ -478,65 +630,46 @@ func (a *Agent) Stats() map[string]map[string]string {
 	return stats
 }
 
-func (a *Agent) createConsulConfig() {
-	cfg := &consul.ConsulConfig{
-		Addr:      a.config.ConsulConfig.Addr,
-		Token:     a.config.ConsulConfig.Token,
-		Auth:      a.config.ConsulConfig.Auth,
-		EnableSSL: a.config.ConsulConfig.EnableSSL,
-		VerifySSL: a.config.ConsulConfig.VerifySSL,
-		CAFile:    a.config.ConsulConfig.CAFile,
-		CertFile:  a.config.ConsulConfig.CertFile,
-		KeyFile:   a.config.ConsulConfig.KeyFile,
-	}
-	a.consulConfig = cfg
-}
-
-// syncAgentServicesWithConsul syncs the client and server services with Consul
-func (a *Agent) syncAgentServicesWithConsul(clientHttpAddr string, serverHttpAddr string) error {
-	cs, err := consul.NewConsulService(a.consulConfig, a.logger)
+// setupConsulSyncer creates the Consul tasks used by this Nomad Agent
+// (either Client or Server mode).
+func (a *Agent) setupConsulSyncer() error {
+	var err error
+	a.consulSyncer, err = consul.NewSyncer(a.config.Consul, a.shutdownCh, a.logger)
 	if err != nil {
 		return err
 	}
-	a.consulService = cs
-	var services []*structs.Service
-	if a.client != nil && a.config.ConsulConfig.ClientServiceName != "" {
-		if err != nil {
-			return err
-		}
-		clientService := &structs.Service{
-			Name:      a.config.ConsulConfig.ClientServiceName,
-			PortLabel: clientHttpAddr,
-		}
-		services = append(services, clientService)
-		cs.SetServiceIdentifier("agent-client")
-	}
-	if a.server != nil && a.config.ConsulConfig.ServerServiceName != "" {
-		serverService := &structs.Service{
-			Name:      a.config.ConsulConfig.ServerServiceName,
-			PortLabel: serverHttpAddr,
-		}
-		services = append(services, serverService)
-		cs.SetServiceIdentifier("agent-server")
-	}
 
-	cs.SetAddrFinder(func(portLabel string) (string, int) {
+	a.consulSyncer.SetAddrFinder(func(portLabel string) (string, int) {
 		host, port, err := net.SplitHostPort(portLabel)
 		if err != nil {
-			return "", 0
+			p, err := strconv.Atoi(port)
+			if err != nil {
+				return "", 0
+			}
+			return "", p
 		}
 
-		// if the addr for the service is ":port", then we default to
-		// registering the service with ip as the loopback addr
+		// If the addr for the service is ":port", then we fall back
+		// to Nomad's default address resolution protocol.
+		//
+		// TODO(sean@): This should poll Consul to figure out what
+		// its advertise address is and use that in order to handle
+		// the case where there is something funky like NAT on this
+		// host.  For now we just use the BindAddr if set, otherwise
+		// we fall back to a loopback addr.
 		if host == "" {
-			host = "127.0.0.1"
+			if a.config.BindAddr != "" {
+				host = a.config.BindAddr
+			} else {
+				host = "127.0.0.1"
+			}
 		}
 		p, err := strconv.Atoi(port)
 		if err != nil {
-			return "", 0
+			return host, 0
 		}
 		return host, p
 	})
 
-	return cs.SyncServices(services)
+	return nil
 }
